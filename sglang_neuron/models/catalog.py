@@ -240,6 +240,15 @@ MODELS = {
     # writes the prefill's KV into the decode kernel's own caches. The decode also runs on SGLang's fake KV transfer,
     # measured alone, and refuses every other backend (launch._decode_problems).
     # The MXFP4 checkpoint is a Quark export, which each role's graphs load themselves.
+    "HYV4ForCausalLM": ModelSpec(package="sglang_neuron.models.hy4",
+                                 kv_cache_dtypes=("auto", "bf16", "bfloat16"),
+                                 quantizations=("compressed-tensors",),
+                                 page_sizes=(1024, 2048, 512),
+                                 launch_settings=(LaunchSetting(
+                                     "UNSAFE_FP8FNCAST", "1",
+                                     "Hy4's NKI kernels read the FP8 experts as trn2's e4m3 (values halved to at most "
+                                     "224 at load, models/hy4/weights.py)"),),
+                                 owns_dsa_attention=True),
     "GlmMoeDsaForCausalLM": ModelSpec(
         package="sglang_neuron.models.glm52",
         kv_cache_dtypes=("auto", "bf16", "bfloat16"),

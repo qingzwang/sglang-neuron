@@ -79,11 +79,6 @@ class NodeShmMin:
 
         if platform.machine() != "x86_64":
             raise RuntimeError(f"NodeShmMin relies on x86-64 store / load ordering, not {platform.machine()}")
-        if sys.version_info < (3, 13):
-            raise RuntimeError("NodeShmMin needs Python >= 3.13 for "
-                               "SharedMemory(track=False): the segment's name is unlinked once every rank has "
-                               "attached, and no resource tracker may own it. This is Python "
-                               "%d.%d" % sys.version_info[:2])
         if op not in ("min", "max"):
             raise ValueError(f"NodeShmMin: op must be 'min' or 'max', not {op!r}")
         self.local_rank, self.local_size, self.capacity, self.timeout_s = local_rank, local_size, capacity, timeout_s
@@ -94,17 +89,17 @@ class NodeShmMin:
         head = 8 * (4 * local_size + 2)
         size = head + rows_bytes + capacity * item
         if local_rank == 0:
-            self._shm = shared_memory.SharedMemory(name=name, create=True, size=size, track=False)
+            self._shm = _untracked_segment(shared_memory, name=name, create=True, size=size)
             try:
                 self._shm.buf[:size] = b"\0" * size
                 self._map(head, rows_bytes)
                 barrier()  # the others attach
                 barrier()  # every rank has attached and posted its pid
             finally:
-                self._shm.unlink()
+                _unlink(self._shm)
         else:
             barrier()
-            self._shm = shared_memory.SharedMemory(name=name, track=False)
+            self._shm = _untracked_segment(shared_memory, name=name)
             self._map(head, rows_bytes)
             barrier()
         self.round = 0
@@ -238,9 +233,33 @@ def _alive(pid: int) -> bool:
     return state not in ("Z", "X")
 
 
+def _untracked_segment(shared_memory, **kwargs):
+    """A SharedMemory no resource tracker owns: ``track=False`` from Python 3.13; before it, the creator's segment is
+    unregistered from the tracker right after it is created, which leaves it as untracked as ``track=False`` does."""
+    if sys.version_info >= (3, 13):
+        return shared_memory.SharedMemory(track=False, **kwargs)
+    from multiprocessing import resource_tracker
+
+    shm = shared_memory.SharedMemory(**kwargs)
+    if kwargs.get("create"):
+        # an attach registers nothing to undo on Linux before 3.13 (only the creator's segment is tracked)
+        resource_tracker.unregister(shm._name, "shared_memory")
+    return shm
+
+
+def _unlink(shm) -> None:
+    """Unlink the segment's name without going through a resource tracker (it is untracked, _untracked_segment)."""
+    if sys.version_info >= (3, 13):
+        shm.unlink()
+        return
+    import _posixshmem
+
+    _posixshmem.shm_unlink(shm._name)
+
+
 def shm_supported() -> bool:
-    """Whether this process can run a NodeShmMin: x86-64, Python >= 3.13 and a usable /dev/shm."""
-    return (platform.machine() == "x86_64" and sys.version_info >= (3, 13)
+    """Whether this process can run a NodeShmMin: x86-64 and a usable /dev/shm."""
+    return (platform.machine() == "x86_64"
             and os.path.isdir("/dev/shm") and os.access("/dev/shm", os.W_OK))
 
 

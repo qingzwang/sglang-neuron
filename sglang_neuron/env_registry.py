@@ -32,6 +32,9 @@ KNOBS: dict = {
     "SGLANG_NEURON_GLM52_POINT": CONFIG,
     "SGLANG_NEURON_GLM52_MTP_SYNTHETIC_AL": BENCHMARK,
     "SGLANG_NEURON_GLM52_ATTN_W8": CONFIG,
+    # Hy4 (models/hy4): the staged runtime (runtime.py) and the sparse attention's per-rank key cap (model.py)
+    "SGLANG_NEURON_HY4_STAGED": CONFIG,
+    "SGLANG_NEURON_HY4_SPARSE_CAP": CONFIG,
     # the Kimi-K3 prompt cache on the PD prefill (--radix-cache-backend kimi-prompt, mem_cache/kimi_prompt_backend):
     # its host tier, keep_previous, the chunk ends and the read-back of each page copy of a hit
     "SGLANG_NEURON_KIMI_PROMPT_HOST_SLOTS": CONFIG,
