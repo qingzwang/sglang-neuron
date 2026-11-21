@@ -51,6 +51,11 @@ MASKED = -1.0e30
 # (max - min) / bins ** rounds of the exact top-k bound, so at most the keys that close above it join the selection
 SELECT_BINS = 16
 SELECT_ROUNDS = 4
+# up to this many rows the attention merge gathers every rank's (max, sum) in one all-gather (Attention.merge)
+MERGE_GATHER_ROWS = 64
+# the decode's (one all-reduce a round; its counting is over a few rows): 256 ** 2 = 16 ** 4
+DECODE_SELECT_BINS = 256
+DECODE_SELECT_ROUNDS = 2
 # the key tile of the prefill's attention and indexer: one tile's scores are [chunk, heads, KEY_TILE] fp32
 KEY_TILE = 1024
 # Sparse attention over a compacted selection: each rank attends each query over at most SPARSE_CAP of its own
@@ -112,7 +117,7 @@ def rotate(x, cos, sin):
     return x * c + torch.cat([-x[..., half:], x[..., :half]], dim=-1) * s
 
 
-def topk_mask(scores, valid, k: int, group: _Group):
+def topk_mask(scores, valid, k: int, group: _Group, bins: int = None, rounds: int = None):
     """The keys of each row among the ``k`` highest-scoring of the row's valid keys on every rank: ``scores`` and
     ``valid`` are [R, T] (fp32 and bool) over this rank's keys. Every valid key where a row has at most ``k``;
     otherwise the keys at or above a threshold found by bisecting the row's global score range in SELECT_ROUNDS rounds
@@ -125,10 +130,11 @@ def topk_mask(scores, valid, k: int, group: _Group):
     # rows with no valid key anywhere (padding): an empty range
     lo = torch.where(lo > hi, hi, lo)
     s = torch.where(valid, scores, torch.full_like(scores, -big))
-    steps = torch.arange(SELECT_BINS, dtype=torch.float32, device=scores.device)
+    bins = bins or SELECT_BINS
+    steps = torch.arange(bins, dtype=torch.float32, device=scores.device)
     total = None
-    for _ in range(SELECT_ROUNDS):
-        width = (hi - lo) / SELECT_BINS
+    for _ in range(rounds or SELECT_ROUNDS):
+        width = (hi - lo) / bins
         edges = lo[:, None] + width[:, None] * steps[None, :]
         counts = None
         for start in range(0, s.shape[1], KEY_TILE):
@@ -243,9 +249,16 @@ class Attention(nn.Module):
         """Merge every rank's partial softmax (out [T, H, latent] fp32, unnormalized; m, l [T, H]) with each head's
         sink counted once, and leave this rank its own heads' attended latents [T, heads, latent]."""
         sinks = self.sinks[None, :]
-        big_m = self.group.all_reduce(torch.maximum(m, sinks), "max")
-        w = torch.exp(m - big_m)
-        total = self.group.all_reduce(w * l) + torch.exp(sinks - big_m)
+        if m.shape[0] <= MERGE_GATHER_ROWS:
+            # few rows (the decode): one all-gather of every rank's (m, l) instead of two all-reduces, latency bound
+            ml = self.group.all_gather(torch.stack([m, l], dim=0)[None], dim=0)  # [ranks, 2, T, H]
+            big_m = torch.maximum(ml[:, 0].amax(0), sinks)
+            w = torch.exp(m - big_m)
+            total = (torch.exp(ml[:, 0] - big_m[None]) * ml[:, 1]).sum(0) + torch.exp(sinks - big_m)
+        else:
+            big_m = self.group.all_reduce(torch.maximum(m, sinks), "max")
+            w = torch.exp(m - big_m)
+            total = self.group.all_reduce(w * l) + torch.exp(sinks - big_m)
         scaled = out * (w / total)[..., None]
         t, h, r = scaled.shape
         mine = self.group.reduce_scatter(scaled.reshape(t, h * r), dim=-1)
@@ -297,6 +310,7 @@ _NKI = os.environ.get("HY4_NKI", "1") != "0"
 _NKI_ATTN = _NKI and os.environ.get("HY4_NKI_ATTN", "1") != "0"
 _NKI_INDEX = _NKI and os.environ.get("HY4_NKI_INDEX", "1") != "0"
 _NKI_MOE = _NKI and os.environ.get("HY4_NKI_MOE", "1") != "0"
+_MOE_DECODE_V2 = os.environ.get("HY4_MOE_DECODE_V2", "1") != "0"
 
 
 def _nki_attend_ok(query, rows) -> bool:
@@ -310,6 +324,16 @@ def _nki_attend_ok(query, rows) -> bool:
 
 
 _NKI_HC = _NKI and os.environ.get("HY4_NKI_HC", "1") != "0"
+_NKI_SPARSE = _NKI and os.environ.get("HY4_NKI_SPARSE", "1") != "0"
+
+
+def _nki_sparse_ok(query, rows) -> bool:
+    """Whether the sparse prefill attention runs as kernels/mla_sparse.py: row blocks of 128 (tokens x heads) whose
+    tokens' slots fill whole 512-key tiles, at most 2048."""
+    t, h = query.shape[0], query.shape[1]
+    slots = (128 // h) * rows.shape[1] if 128 % h == 0 else 0
+    return (_NKI_SPARSE and query.device.type != "cpu" and slots and slots % 512 == 0 and slots <= 2048
+            and (t * h) % 256 == 0)
 
 
 def _nki_hc_ok(streams) -> bool:
@@ -395,7 +419,9 @@ class MoE(nn.Module):
         chosen = chosen / (chosen.sum(-1, keepdim=True) + 1e-20) * cfg.routed_scaling_factor
         return experts, chosen
 
-    def forward(self, x, rank):
+    def forward(self, x, rank, real=None):
+        """``real`` [T] (1 for a real row, 0 for padding): padding rows route to no expert in the prefill (identical
+        rows all choose the same experts, which would fill a local expert's blocks with them)."""
         cfg = self.config
         if "moe_route" in _ABLATE:
             experts = torch.zeros(x.shape[0], cfg.num_experts_per_tok, dtype=torch.int64, device=x.device)
@@ -408,6 +434,8 @@ class MoE(nn.Module):
         local = first + torch.arange(self.num_local, device=x.device)
         # each token's weight on each local expert [T, E], zero off its choices
         aff = (chosen[:, :, None] * (experts[:, :, None] == local[None, None, :]).to(torch.float32)).sum(1)
+        if real is not None and self.phase != "decode":
+            aff = aff * real[:, None]
         if self.phase == "decode" and x.device.type != "cpu":
             out = self._decode_kernel(x, aff)
         elif _NKI_MOE and x.device.type != "cpu" and x.shape[0] % 128 == 0:
@@ -457,9 +485,15 @@ class MoE(nn.Module):
         key = hit * self.num_local - torch.arange(self.num_local, device=x.device, dtype=torch.float32) / 2
         order = torch.topk(key, self.num_local).indices.to(torch.int32).reshape(1, -1)
         n_hit = hit.sum().to(torch.int32).reshape(1, 1)
-        kernel = wrap_nki(moe_decode_fp8)[get_logical_nc_config()]
-        parts = kernel(x.t().contiguous(), aff.t().contiguous(), order, n_hit, self.gate_up, self.gate_up_scale,
-                       self.down, self.down_scale, limit=float(self.config.swiglu_limit or 3.0e38))
+        limit = float(self.config.swiglu_limit or 3.0e38)
+        args = (x.t().contiguous(), aff.t().contiguous(), order, n_hit, self.gate_up, self.gate_up_scale, self.down,
+                self.down_scale)
+        if _MOE_DECODE_V2:
+            # token-major: the block scales in the activations, each weight block one matmul (kernels/moe_decode2.py)
+            from sglang_neuron.models.hy4.kernels.moe_decode2 import moe_decode_fp8_tm
+
+            return wrap_nki(moe_decode_fp8_tm)[get_logical_nc_config()](*args, limit=limit).sum(0).to(DTYPE)
+        parts = wrap_nki(moe_decode_fp8)[get_logical_nc_config()](*args, limit=limit)
         return parts.sum(0).t().to(DTYPE)
 
 
@@ -639,12 +673,14 @@ class Hy4Graph(nn.Module):
             valid = valid & (table[0].to(torch.int64).repeat_interleave(block) >= 0)[None, :]
         # as uint8: the step crosses program boundaries (runtime.py), and a boolean program input of this shape hits a
         # neuronx-cc internal error (NCC_ILSA902) in the dense prefill attention
-        return streams, (cos, sin, write_rows, key_rows, valid.to(torch.uint8))
+        # the step's real rows (a padding row's slot is 0: page 0 is reserved), as the MoE's routing mask
+        real = (md["slot_mapping"].to(torch.int64) > 0).to(torch.float32)
+        return streams, (cos, sin, write_rows, key_rows, valid.to(torch.uint8), real)
 
     def run_layer(self, layer, cache, index_cache, streams, step, state, rank, replicated: bool = False):
         """One decoder layer over ``streams``; ``state`` is the selection of the last full layer (a shared layer's),
         returned updated by a full layer: (compacted rows, keep) with SPARSE_CAP, else (mask,)."""
-        cos, sin, write_rows, key_rows, valid = step
+        cos, sin, write_rows, key_rows, valid, real = step
         valid = valid != 0
         attn = layer.self_attn
         if "hc" in _ABLATE:
@@ -684,7 +720,7 @@ class Hy4Graph(nn.Module):
         if "moe" in _ABLATE and not layer.dense:
             out = layer.mlp.shared(x)
         else:
-            out = layer.mlp(x) if layer.dense else layer.mlp(x, rank)
+            out = layer.mlp(x) if layer.dense else layer.mlp(x, rank, real)
         out = self.group.all_reduce(out)
         streams = streams + out[:, None, :] if "hc" in _ABLATE else HyperConnection.post(streams, out, post)
         return streams, state
@@ -729,6 +765,9 @@ class Hy4Graph(nn.Module):
                 s = torch.einsum("thd,kd->thk", iq.float(), keys).relu()
                 parts.append((s * iw[:, :, None]).sum(1))
             scores = torch.cat(parts, dim=1)
+        if self.phase == "decode":
+            # a decode step's collectives are latency bound: the same resolution in two rounds of wider bins
+            return topk_mask(scores, valid, cfg.index_topk, self.group, DECODE_SELECT_BINS, DECODE_SELECT_ROUNDS), scores
         return topk_mask(scores, valid, cfg.index_topk, self.group), scores
 
     def _compact(self, selected, scores, key_rows):
@@ -748,6 +787,18 @@ class Hy4Graph(nn.Module):
         """Each head of each query over the rank's compacted selected keys (rows [R, cap]), merged across the ranks."""
         cfg = self.config
         scale, latent = cfg.softmax_scale, cfg.kv_lora_rank
+        if self.phase != "decode" and _nki_sparse_ok(query, rows):
+            # each row block over its tokens' gathered rows in one NKI kernel (kernels/mla_sparse.py)
+            from sglang_neuron.backend.stack import wrap_nki
+            from sglang_neuron.models.hy4.kernels.mla_dense import onehot_rows
+            from sglang_neuron.models.hy4.kernels.mla_sparse import block_slots, mla_sparse
+            from sglang_neuron.utils.hardware_config import get_logical_nc_config
+
+            h, d = query.shape[1], query.shape[2]
+            slots, bias = block_slots(rows, keep, h, cache.shape[0])
+            out, ml = wrap_nki(mla_sparse)[get_logical_nc_config()](
+                query.to(DTYPE).reshape(-1, 128, d), cache, slots, bias, onehot_rows(h, query.device), scale=scale)
+            return attn.merge_head_major(out, ml[..., 0], ml[..., 1])
         ms, ls, outs = [], [], []
         tile = rows.shape[0] if self.phase == "decode" else QUERY_TILE
         for start in range(0, rows.shape[0], tile):

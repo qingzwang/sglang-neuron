@@ -263,9 +263,11 @@ def _norms(t):
     return f"sum|x|={t.abs().sum().item():.6g} row0={t.reshape(t.shape[0], -1)[0].abs().sum().item():.6g}"
 
 
-# the prefill's context buckets (tokens) below the server's context; HY4_PREFILL_BUCKETS="" compiles the context alone
+# the prefill's context buckets (tokens) below the server's context; HY4_PREFILL_BUCKETS="" compiles the context alone.
+# A bucket of a power-of-two pages keeps a rank's keys a multiple of 512 (the NKI kernels' key tile): the server's whole
+# table is one page longer
 PREFILL_CONTEXT_BUCKETS = tuple(int(b) for b in __import__("os").environ.get(
-    "HY4_PREFILL_BUCKETS", "32768,131072").split(",") if b.strip())
+    "HY4_PREFILL_BUCKETS", "32768,131072,524288").split(",") if b.strip())
 
 
 class Hy4StagedRuntime(NeuronModelRuntime):
