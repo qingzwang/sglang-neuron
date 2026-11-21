@@ -17,7 +17,8 @@ routing weight; ``nblk`` counts the blocks. The kernel walks them in a device lo
 3. silu(min(gate, L)) * clamp(up, -L, L) times the token's weight, transposed for the down projection;
 4. down: the same, accumulated token-major in PSUM, and scatter-added into the output rows (DMA read-modify-write).
 
-The two programs of a logical core take one half of the intermediate dimension each, and each adds into its own half
+The expert weights are loaded by the sync engine's hardware DGE (the GpSimd's software DGE took ~0.7 us a DMA and
+bound the kernel). The two programs of a logical core take one half of the intermediate dimension each, and each adds into its own half
 of ``out`` ([2, T, H] fp32), which the caller sums."""
 
 import nki
@@ -113,7 +114,7 @@ def moe_prefill_fp8(x, tok, tok_out, aff, bexp, nblk, gate_up, gate_up_scale, do
             for g in range(2):
                 nisa.dma_copy(dst=w8[0:P, g, 0:IH],
                               src=gate_up.ap(pattern=[[2 * I, P], [1, IH]], offset=kb * P * 2 * I + g * I + i0,
-                                             scalar_offset=e, indirect_dim=0))
+                                             scalar_offset=e, indirect_dim=0), dge_mode=nisa.dge_mode.hwdge, engine=nisa.engine.sync)
             wb = nl.ndarray((P, 2, IH), dtype=nl.bfloat16, buffer=nl.sbuf)
             dequant(wb.reshape((P, 2 * IH)), w8.reshape((P, 2 * IH)), gs, KH * 2 * OB, kb * 2 * OB, 2 * OB, kb)
             for g in range(2):
@@ -149,7 +150,7 @@ def moe_prefill_fp8(x, tok, tok_out, aff, bexp, nblk, gate_up, gate_up_scale, do
             for ki in range(KI):
                 d8 = nl.ndarray((P, W), dtype=down.dtype, buffer=nl.sbuf)
                 nisa.dma_copy(dst=d8[0:P, 0:W], src=down.ap(pattern=[[H, P], [1, W]], offset=(i0 + ki * P) * H + c0,
-                                                              scalar_offset=e, indirect_dim=0))
+                                                              scalar_offset=e, indirect_dim=0), dge_mode=nisa.dge_mode.hwdge, engine=nisa.engine.sync)
                 db = nl.ndarray((P, W), dtype=nl.bfloat16, buffer=nl.sbuf)
                 dequant(db[0:P, 0:W], d8[0:P, 0:W], ds, KI * (H // P), ki * (H // P) + c0 // P, W // P, ki)
                 for c in range(HALF):

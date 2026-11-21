@@ -311,6 +311,7 @@ _NKI_ATTN = _NKI and os.environ.get("HY4_NKI_ATTN", "1") != "0"
 _NKI_INDEX = _NKI and os.environ.get("HY4_NKI_INDEX", "1") != "0"
 _NKI_MOE = _NKI and os.environ.get("HY4_NKI_MOE", "1") != "0"
 _MOE_DECODE_V2 = os.environ.get("HY4_MOE_DECODE_V2", "1") != "0"
+_NKI_COMPACT = _NKI and os.environ.get("HY4_NKI_COMPACT", "1") != "0"
 
 
 def _nki_attend_ok(query, rows) -> bool:
@@ -490,9 +491,11 @@ class MoE(nn.Module):
                 self.down_scale)
         if _MOE_DECODE_V2:
             # token-major: the block scales in the activations, each weight block one matmul (kernels/moe_decode2.py)
-            from sglang_neuron.models.hy4.kernels.moe_decode2 import moe_decode_fp8_tm
+            from sglang_neuron.models.hy4.kernels.moe_decode2 import TILE, moe_decode_fp8_ct, moe_decode_fp8_tm
 
-            return wrap_nki(moe_decode_fp8_tm)[get_logical_nc_config()](*args, limit=limit).sum(0).to(DTYPE)
+            # up to TILE tokens on the tensor engine's column tiles, four matmuls at once
+            kernel = moe_decode_fp8_ct if x.shape[0] <= TILE else moe_decode_fp8_tm
+            return wrap_nki(kernel)[get_logical_nc_config()](*args, limit=limit).sum(0).to(DTYPE)
         parts = wrap_nki(moe_decode_fp8)[get_logical_nc_config()](*args, limit=limit)
         return parts.sum(0).t().to(DTYPE)
 
@@ -774,6 +777,15 @@ class Hy4Graph(nn.Module):
         """(the local rows [R, cap] of each row's highest-scoring selected keys on this rank, whether each is one
         [R, cap]); a row with fewer selected keys pads with unselected ones, masked."""
         cap = min(self.sparse_cap, scores.shape[-1])
+        if self.phase == "decode" and _NKI_COMPACT and scores.device.type != "cpu":
+            # the selection itself, compacted on the GpSimd engine (kernels/decode_compact.py): no top-k over the keys
+            from sglang_neuron.backend.stack import wrap_nki
+            from sglang_neuron.models.hy4.kernels.decode_compact import decode_compact
+            from sglang_neuron.utils.hardware_config import get_logical_nc_config
+
+            rows, keep = wrap_nki(decode_compact)[get_logical_nc_config()](
+                selected.to(torch.float32), key_rows.to(torch.int32), cap=cap, pad_row=0)
+            return rows, keep > 0
         ranked = torch.where(selected, scores, torch.full_like(scores, MASKED))
         values, idx = torch.topk(ranked, cap, dim=-1)
         keep = values > MASKED / 2
