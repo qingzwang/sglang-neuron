@@ -132,6 +132,7 @@ def moe_decode_fp8_tm(xT, affT, hit, n_hit, gate_up, gate_up_scale, down, down_s
 
 
 TILE = 32  # a tensor-engine column tile: up to T <= 32 tokens
+KB_DMA = 4  # the column-tiled kernel's gate / up row blocks a weight DMA
 WEIGHT_DMA_ENGINES = (nisa.engine.sync, nisa.engine.scalar)  # the weight DMAs' trigger engines, in turn
 
 
@@ -195,12 +196,15 @@ def moe_decode_fp8_ct(xT, affT, hit, n_hit, gate_up, gate_up_scale, down, down_s
         # gate / up: [32 c + t, g, q, column] for column block 4 q + c
         gu = nl.ndarray((P, 2, OQ, P), dtype=nl.float32, buffer=nl.psum)
         for kb in range(KH):
-            wt = nl.ndarray((P, 2, IH), dtype=gate_up.dtype, buffer=nl.sbuf)
-            for g in range(2):
-                nisa.dma_copy(dst=wt[0:P, g, 0:IH],
-                              src=gate_up.ap(pattern=[[2 * I, P], [1, IH]], offset=kb * P * 2 * I + g * I + i0,
-                                             scalar_offset=e, indirect_dim=0),
-                              dge_mode=nisa.dge_mode.hwdge, engine=WEIGHT_DMA_ENGINES[(2 * kb + g) % 2])
+            if kb % KB_DMA == 0:
+                # KB_DMA row blocks a DMA (larger transfers): wts[kb0 + j] is row block kb0 + j
+                wts = nl.ndarray((P, KB_DMA, 2, IH), dtype=gate_up.dtype, buffer=nl.sbuf)
+                for g in range(2):
+                    nisa.dma_copy(dst=wts[0:P, 0:KB_DMA, g, 0:IH],
+                                  src=gate_up.ap(pattern=[[2 * I, P], [P * 2 * I, KB_DMA], [1, IH]],
+                                                 offset=kb * P * 2 * I + g * I + i0, scalar_offset=e, indirect_dim=0),
+                                  dge_mode=nisa.dge_mode.hwdge, engine=WEIGHT_DMA_ENGINES[(kb // KB_DMA + g) % 2])
+            wt = wts[0:P, kb % KB_DMA]
             xsc = nl.ndarray((P, 2, OB, T), dtype=nl.bfloat16, buffer=nl.sbuf)
             nisa.tensor_tensor(dst=xsc[0:P, 0:2, 0:OB, 0:T],
                                data1=xs.ap(pattern=[[KH * T, P], [0, 2], [0, OB], [1, T]], offset=kb * T),

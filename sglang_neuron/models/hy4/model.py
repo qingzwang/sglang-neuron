@@ -312,6 +312,7 @@ _NKI_INDEX = _NKI and os.environ.get("HY4_NKI_INDEX", "1") != "0"
 _NKI_MOE = _NKI and os.environ.get("HY4_NKI_MOE", "1") != "0"
 _MOE_DECODE_V2 = os.environ.get("HY4_MOE_DECODE_V2", "1") != "0"
 _NKI_COMPACT = _NKI and os.environ.get("HY4_NKI_COMPACT", "1") != "0"
+_NKI_HC_DECODE = _NKI and os.environ.get("HY4_NKI_HC_DECODE", "1") != "0"
 
 
 def _nki_attend_ok(query, rows) -> bool:
@@ -556,6 +557,23 @@ class HyperConnection(nn.Module):
             magnitude=cfg.hc_magnitude)
         return x, post
 
+    def post_pre_decode(self, streams, out, post):
+        """post(streams, out, post), then this mixer's pre, in one decode kernel: (streams', x, post')."""
+        from sglang_neuron.backend.stack import wrap_nki
+        from sglang_neuron.models.hy4.kernels.hc_decode import decode_constants, hc_decode
+        from sglang_neuron.utils.hardware_config import get_logical_nc_config
+
+        cfg = self.config
+        n, rows = cfg.hc_mult, self.fn.shape[0]
+        t = streams.shape[0]
+        scale = torch.cat([self.scale[0].expand(n), self.scale[-1].expand(rows - n)]) if rows == 2 * n else \
+            self.scale[0].expand(rows)
+        ones, place = decode_constants(n, streams.device)
+        new, x, post_next = wrap_nki(hc_decode)[get_logical_nc_config()](
+            streams.reshape(t, -1), out.to(DTYPE), post, self.fn, torch.stack([scale, self.base]).contiguous(), ones,
+            place, rms_eps=cfg.rms_norm_eps, hc_eps=cfg.hc_eps, magnitude=cfg.hc_magnitude)
+        return new.reshape(streams.shape), x, post_next
+
     @staticmethod
     def post(streams, out, post):
         if _nki_hc_ok(streams):
@@ -714,10 +732,14 @@ class Hy4Graph(nn.Module):
         else:
             attended = self._attend(attn, cache, query, key_rows, state[0])
         out = attn.output(attended, x)
-        streams = streams + out[:, None, :] if "hc" in _ABLATE else HyperConnection.post(streams, out, post)
         if "hc" in _ABLATE:
+            streams = streams + out[:, None, :]
             x = streams[:, 0]
+        elif self.phase == "decode" and _NKI_HC_DECODE and streams.device.type != "cpu":
+            # the attention's post and the MLP's pre in one NKI kernel (kernels/hc_decode.py)
+            streams, x, post = layer.mlp_hc.post_pre_decode(streams, out, post)
         else:
+            streams = HyperConnection.post(streams, out, post)
             x, post = layer.mlp_hc.pre(streams)
         x = layer.post_attention_layernorm(x)
         if "moe" in _ABLATE and not layer.dense:
