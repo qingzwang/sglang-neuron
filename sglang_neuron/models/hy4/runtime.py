@@ -168,6 +168,20 @@ class StagedStep:
         self.group = compile_fn(group_fn, tensor_guards_only=True)
         head = _Head(graph)
         self.head = compile_fn(_HeadIO(SampledExecution(head, execution_model.mode) if sampled else head, token_io))
+        # DFly speculative decoding (dfly.py): a decode step is a verify of Q rows a request, then the drafter's
+        # program over the verify's final streams and the selections of the groups that end in a producer layer
+        self.draft = None
+        if graph.phase == "decode" and getattr(graph, "dfly", None) is not None:
+            from sglang_neuron.models.hy4.dfly import DFlyStep
+
+            d = graph.dfly.dfly
+            last = [ids[-1] for ids in self.groups]
+            missing = [i for i in d.index_layers if i not in last]
+            if missing:
+                raise ValueError(f"Hy4 DFly: the producer layers {missing} end no layer group ({last})")
+            self.producer_groups = [last.index(i) for i in d.index_layers]
+            self.draft_caches = [graph.layers[i].self_attn for i in d.kv_layers]
+            self.draft = compile_fn(DFlyStep(graph))
 
     # the prefill's context buckets (tokens): set by the runtime, with the host length of the step it launches next
     context_buckets = ()
@@ -217,9 +231,11 @@ class StagedStep:
                                              kwargs.get("token_control"), blocks)
         sync(streams)
         t1 = time.perf_counter()
-        for params, attns in zip(self.group_params, self.group_caches):
+        states = {}
+        for gi, (params, attns) in enumerate(zip(self.group_params, self.group_caches)):
             index_cache = next(a.index_cache for a in attns if a.full)
             streams, state = self.group(params, [a.cache for a in attns], index_cache, streams, step, state, rank)
+            states[gi] = state
         sync(streams)
         t2 = time.perf_counter()
         head_kwargs = {k: v for k, v in kwargs.items() if k.startswith("sampling_")}
@@ -228,10 +244,18 @@ class StagedStep:
         out = self.head(streams=streams, positions=kwargs["positions"], **head_kwargs)
         sync(out)
         t3 = time.perf_counter()
+        if self.draft is not None and "dfly_cand" in kwargs:
+            drafted = self.draft(streams, [states[gi] for gi in self.producer_groups], out["token_ids"],
+                                 kwargs["dfly_cand"], kwargs["dfly_base"], kwargs["dfly_slots"],
+                                 [a.cache for a in self.draft_caches], int(md["block_size"]), rank)
+            out = {**out, **{f"dfly_{k}": v for k, v in drafted.items()}}
+            sync(drafted["drafts"])
+        t4 = time.perf_counter()
         if int(self.graph.group.coordinator.rank_in_group) == 0:
-            logger.info("Hy4 timing %s rows=%d: prologue %.1f ms, %d groups %.1f ms (%.2f each), head %.1f ms",
-                        self.graph.phase, kwargs["positions"].shape[0], (t1 - t0) * 1e3, len(self.groups),
-                        (t2 - t1) * 1e3, (t2 - t1) * 1e3 / len(self.groups), (t3 - t2) * 1e3)
+            logger.info("Hy4 timing %s rows=%d: prologue %.1f ms, %d groups %.1f ms (%.2f each), head %.1f ms, "
+                        "draft %.1f ms", self.graph.phase, kwargs["positions"].shape[0], (t1 - t0) * 1e3,
+                        len(self.groups), (t2 - t1) * 1e3, (t2 - t1) * 1e3 / len(self.groups), (t3 - t2) * 1e3,
+                        (t4 - t3) * 1e3)
         return out
 
     def _call(self, blocks: int = 0, **kwargs):
@@ -243,15 +267,23 @@ class StagedStep:
         debug = _DEBUG and int(self.graph.group.coordinator.rank_in_group) == 0
         if debug:
             logger.info("Hy4 debug prologue streams %s", _norms(streams))
+        states = {}
         for gi, (params, attns) in enumerate(zip(self.group_params, self.group_caches)):
             index_cache = next(a.index_cache for a in attns if a.full)
             streams, state = self.group(params, [a.cache for a in attns], index_cache, streams, step, state, rank)
+            states[gi] = state
             if debug:
                 logger.info("Hy4 debug group %d streams %s state %s", gi, _norms(streams), _norms(state[0]))
         head_kwargs = {k: v for k, v in kwargs.items() if k.startswith("sampling_")}
         if kwargs.get("token_ids_out") is not None:
             head_kwargs["token_ids_out"] = kwargs["token_ids_out"]
-        return self.head(streams=streams, positions=kwargs["positions"], **head_kwargs)
+        out = self.head(streams=streams, positions=kwargs["positions"], **head_kwargs)
+        if self.draft is not None and "dfly_cand" in kwargs:
+            drafted = self.draft(streams, [states[gi] for gi in self.producer_groups], out["token_ids"],
+                                 kwargs["dfly_cand"], kwargs["dfly_base"], kwargs["dfly_slots"],
+                                 [a.cache for a in self.draft_caches], int(md["block_size"]), rank)
+            out = {**out, **{f"dfly_{k}": v for k, v in drafted.items()}}
+        return out
 
 
 _DEBUG = __import__("os").environ.get("HY4_DEBUG_NORMS") == "1"
@@ -263,6 +295,21 @@ def _norms(t):
     return f"sum|x|={t.abs().sum().item():.6g} row0={t.reshape(t.shape[0], -1)[0].abs().sum().item():.6g}"
 
 
+def dfly_inputs(rows: int, q: int, cand=None, base=None, slots=None) -> dict:
+    """The DFly step's inputs of a decode over ``rows`` rows (Q a request) on the device: the verified ids [rows] (-1:
+    no draft), each request's first verified position [rows / Q] and its KV slots of the next 2 Q - 1 positions
+    [rows / Q, 2 Q - 1]; zeros (no draft, slot 0) where not given."""
+    from sglang_neuron.backend.device_io import upload_many
+    from sglang_neuron.model_executor.runtime_init import neuron_device
+
+    b = rows // q
+    cand = torch.full((rows,), -1, dtype=torch.int32) if cand is None else cand
+    base = torch.zeros(b, dtype=torch.int64) if base is None else base
+    slots = torch.zeros(b, 2 * q - 1, dtype=torch.int64) if slots is None else slots
+    c, p, s = upload_many([cand, base, slots], neuron_device())
+    return {"dfly_cand": c, "dfly_base": p, "dfly_slots": s}
+
+
 # the prefill's context buckets (tokens) below the server's context; HY4_PREFILL_BUCKETS="" compiles the context alone.
 # A bucket of a power-of-two pages keeps a rank's keys a multiple of 512 (the NKI kernels' key tile): the server's whole
 # table is one page longer
@@ -271,6 +318,31 @@ PREFILL_CONTEXT_BUCKETS = tuple(int(b) for b in __import__("os").environ.get(
 
 
 class Hy4StagedRuntime(NeuronModelRuntime):
+    def _dfly_block(self) -> int:
+        """Q, the rows a request verifies a step, on a decode runtime of a DFly launch; else 0."""
+        d = getattr(self.model_graph, "dfly", None)
+        return int(d.dfly.block) if d is not None and self.graphs == "decode" else 0
+
+    def _init_decode_token_io(self) -> None:
+        q = self._dfly_block()
+        if not q:
+            return super()._init_decode_token_io()
+        # a DFly decode step verifies Q rows a request (dfly_worker.py builds them on the host): the decode graphs'
+        # batches are rows, Q of each request, and the ids come from the host (no fixed-width token I/O)
+        import dataclasses
+
+        self.buckets = dataclasses.replace(self.buckets, num_seqs_buckets=[b * q for b in self.buckets.num_seqs_buckets])
+        self.decode_token_width = 0
+        self.decode_token_assemble = False
+        logger.info("Hy4 DFly: decode row buckets %s (%d rows a request)", self.buckets.num_seqs_buckets, q)
+
+    def _synthetic_inputs(self, kind: str, bucket: int, context=None) -> dict:
+        out = super()._synthetic_inputs(kind, bucket, context)
+        q = self._dfly_block()
+        if kind == "decode" and q:
+            out.update(dfly_inputs(bucket, q))
+        return out
+
     def build_model_inputs(self, md, token_ids, bucket, *args, **kwargs):
         out = super().build_model_inputs(md, token_ids, bucket, *args, **kwargs)
         staged = getattr(self, "staged", None)
@@ -309,9 +381,9 @@ class Hy4StagedRuntime(NeuronModelRuntime):
         if self.graphs == "prefill":
             staged.context_buckets = PREFILL_CONTEXT_BUCKETS
         self.staged = staged
-        logger.info("Hy4 staged runtime (%s): prologue of %d layers, %d groups of %d, epilogue", self.graphs,
-                    PROLOGUE_LAYERS, len(staged.groups), GROUP)
-        # three programs a step: the fence meets the ranks at the switches between them
-        self.compiled = program_fence.wrap_compiled(staged, programs=3 * len(self._warm_shapes()))
+        logger.info("Hy4 staged runtime (%s): prologue of %d layers, %d groups of %d, epilogue%s", self.graphs,
+                    PROLOGUE_LAYERS, len(staged.groups), GROUP, ", DFly draft" if staged.draft is not None else "")
+        # three programs a step (four with the draft): the fence meets the ranks at the switches between them
+        self.compiled = program_fence.wrap_compiled(staged, programs=4 * len(self._warm_shapes()))
         self.direct_submit = None
         self.direct_launch = None

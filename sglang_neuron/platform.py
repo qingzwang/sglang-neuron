@@ -671,6 +671,14 @@ class NeuronSRTPlatform(SRTPlatform, NeuronDeviceMixin):
         return "neuron"
 
     # speculative decoding: the served model's own worker (model_executor.spec_worker)
+    def get_default_speculative_draft_attention_backend(self, algorithm: str) -> str:
+        """The draft's attention backend SGLang resolves for DFLASH: the model's own worker runs its drafter in its
+        programs, so the name only passes SGLang's resolution (the platform's own backend)."""
+        return "neuron"
+
+    def supports_speculative_draft_attention_backend(self, algorithm: str, backend: str) -> bool:
+        return backend == "neuron" and self.supports_speculative_algorithm(algorithm)
+
     def supports_speculative_algorithm(self, algorithm: str) -> bool:
         """Whether the launch's model serves ``algorithm`` with its own worker: the algorithm the serving policy
         recorded (catalog.ModelSpec.speculative_algorithms), which the platform defaults resolve before SGLang resolves

@@ -248,6 +248,8 @@ MODELS = {
                                      "UNSAFE_FP8FNCAST", "1",
                                      "Hy4's NKI kernels read the FP8 experts as trn2's e4m3 (values halved to at most "
                                      "224 at load, models/hy4/weights.py)"),),
+                                 # the checkpoint's DFly drafter under SGLang's DFLASH scheduling (models/hy4/dfly.py)
+                                 speculative_algorithms=("DFLASH",),
                                  owns_dsa_attention=True),
     "GlmMoeDsaForCausalLM": ModelSpec(
         package="sglang_neuron.models.glm52",

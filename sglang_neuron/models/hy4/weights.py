@@ -162,3 +162,47 @@ def vocab_rows_loader(rows: int, hidden_size: int) -> SafetensorsWeightLoader:
 
     return SafetensorsWeightLoader(transform=lambda slices, rank: pad_to_shape(
         slices[0][rank * rows:(rank + 1) * rows], (rows, hidden_size)))
+
+
+class Fp8Slice:
+    """A block-FP8 checkpoint weight [out, in] (its slice and its [ceil(out / 128), ceil(in / 128)] scale's) read as
+    bf16, sliced like the weight's own slice: each read dequantizes the whole blocks it covers, then trims. The DFly
+    draft (dfly.py) stores every projection so, while its loaders are the target's bf16 ones."""
+
+    def __init__(self, weight, scale):
+        self.weight, self.scale = weight, scale
+
+    def get_shape(self):
+        return self.weight.get_shape()
+
+    def __getitem__(self, key):
+        shape = self.weight.get_shape()
+        key = key if isinstance(key, tuple) else (key,)
+        key = key + (slice(None),) * (2 - len(key))
+        bounds = []
+        for k, n in zip(key, shape):
+            if not isinstance(k, slice) or k.step not in (None, 1):
+                raise ValueError(f"an FP8 weight slice takes unit-step ranges, not {k!r}")
+            start, stop, _ = k.indices(n)
+            lo, hi = start // BLOCK * BLOCK, min(-(-stop // BLOCK) * BLOCK, n)
+            bounds.append((start, stop, lo, hi))
+        (r0, r1, R0, R1), (c0, c1, C0, C1) = bounds
+        w = self.weight[R0:R1, C0:C1].to(torch.float32)
+        s = self.scale[R0 // BLOCK:-(-R1 // BLOCK), C0 // BLOCK:-(-C1 // BLOCK)].to(torch.float32)
+        s = s.repeat_interleave(BLOCK, 0)[:R1 - R0].repeat_interleave(BLOCK, 1)[:, :C1 - C0]
+        return (w * s)[r0 - R0:r1 - R0, c0 - C0:c1 - C0].to(torch.bfloat16)
+
+
+def fp8(loader: SafetensorsWeightLoader) -> SafetensorsWeightLoader:
+    """``loader`` over block-FP8 weights: the mapping lists each weight then its scale, and ``loader`` sees one bf16
+    slice (Fp8Slice) per weight."""
+    def transform(slices, rank):
+        views = [Fp8Slice(w, s) for w, s in zip(slices[0::2], slices[1::2])]
+        return loader.load(views, rank) if loader.transform is None else loader.transform(views, rank)
+
+    return SafetensorsWeightLoader(transform=transform)
+
+
+def column_shard(rows: int) -> SafetensorsWeightLoader:
+    """A [out, in] projection whose output rows shard over the ranks: this rank's [in, out / tp]."""
+    return SafetensorsWeightLoader(transform=lambda slices, rank: slices[0][rank * rows:(rank + 1) * rows].t())

@@ -71,8 +71,26 @@ class HYV4ForCausalLM(ModelHost):
             raise ValueError(f"--page-size {page}: Hy4's KV is context-parallel over the {tp} ranks; launch with a "
                              f"--page-size that is a multiple of {tp}")
 
+    # DFly (dfly.py): the drafter's KV lives in its target layers' caches, so SGLang builds no draft KV pool
+    # (general_plugin._without_draft_kv_pool)
+    draft_kv_in_model_pools = True
+
+    @classmethod
+    def speculative_worker_cls(cls, algorithm: str):
+        from sglang_neuron.models.hy4 import dfly, dfly_worker
+
+        return dfly_worker.worker_class() if str(algorithm).upper() == dfly.ALGORITHM else None
+
+    def set_dflash_layers_to_capture(self, layer_ids) -> None:
+        """SGLang's DFLASH capture setting: the DFly step reads the decode programs' own outputs (the final streams
+        and the producer layers' selections), so there is nothing to capture."""
+        return None
+
     def build_graph(self, phase: str, config) -> nn.Module:
-        return Hy4Graph(hy4_config(config), phase)
+        from sglang_neuron.models.hy4 import dfly
+
+        d = dfly.dfly_config(config) if dfly.enabled() else None
+        return Hy4Graph(hy4_config(config), phase, dfly=d)
 
     def neuron_compiler_args(self, phase: str, default_args: list) -> list:
         # Both phases compile like the platform's decode (-O2, no modular-flow threshold). The prefill's group program

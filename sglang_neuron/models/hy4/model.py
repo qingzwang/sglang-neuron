@@ -157,7 +157,9 @@ def topk_mask(scores, valid, k: int, group: _Group, bins: int = None, rounds: in
 class Attention(nn.Module):
     """Gated MLA with a learned sink per head over the context-parallel KV; on a full layer, also the DSA indexer."""
 
-    def __init__(self, config: Hy4Config, layer_idx: int, group: _Group):
+    def __init__(self, config: Hy4Config, layer_idx: int, group: _Group, full=None):
+        """``full``: whether the layer runs its own indexer, by default the checkpoint's indexer_types (a DFly draft
+        layer, dfly.py, runs none)."""
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
@@ -168,7 +170,7 @@ class Attention(nn.Module):
             raise ValueError(f"{config.num_attention_heads} attention heads do not shard over an attention TP of {tp}")
         self.heads = heads = config.num_attention_heads // tp
         hidden, latent = config.hidden_size, config.kv_lora_rank
-        self.full = config.indexer_full[layer_idx]
+        self.full = config.indexer_full[layer_idx] if full is None else full
         self.q_a = nn.Parameter(torch.empty(hidden, config.q_lora_rank, dtype=DTYPE))
         self.q_a_layernorm = RMSNorm(config.q_lora_rank, config.rms_norm_eps)
         self.q_b = nn.Parameter(torch.empty(config.q_lora_rank, heads * config.q_head_dim, dtype=DTYPE))
@@ -328,6 +330,8 @@ def _nki_attend_ok(query, rows) -> bool:
 
 _NKI_HC = _NKI and os.environ.get("HY4_NKI_HC", "1") != "0"
 _NKI_SPARSE = _NKI and os.environ.get("HY4_NKI_SPARSE", "1") != "0"
+# a multi-row decode's (DFly verify) attention through the sparse prefill kernel
+_NKI_SPARSE_DECODE = _NKI_SPARSE and os.environ.get("HY4_NKI_SPARSE_DECODE", "0") == "1"  # off: no faster in the served graph (70.0 vs 70.2 ms a 7-row verify)
 
 
 def _nki_sparse_ok(query, rows) -> bool:
@@ -355,12 +359,13 @@ def _nki_index_ok(iq, key_rows) -> bool:
 class MLP(nn.Module):
     """SiLU-gated, the intermediate dimension sharded over the ranks; the caller sums the partial."""
 
-    def __init__(self, config: Hy4Config, intermediate: int, tp: int):
+    def __init__(self, config: Hy4Config, intermediate: int, tp: int, inputs: int = None):
+        """``inputs``: the input width, by default the hidden size."""
         super().__init__()
         if intermediate % tp:
             raise ValueError(f"an intermediate size of {intermediate} does not shard over {tp} ranks")
         rows = intermediate // tp
-        self.gate_up = nn.Parameter(torch.empty(config.hidden_size, 2 * rows, dtype=DTYPE))
+        self.gate_up = nn.Parameter(torch.empty(inputs or config.hidden_size, 2 * rows, dtype=DTYPE))
         self.down = nn.Parameter(torch.empty(rows, config.hidden_size, dtype=DTYPE))
         set_weight_loader(self.gate_up, weights.mlp_gate_up_loader(rows))
         set_weight_loader(self.down, weights.mlp_down_loader(rows))
@@ -580,16 +585,18 @@ class HyperConnection(nn.Module):
     def post_pre_decode(self, streams, out, post):
         """post(streams, out, post), then this mixer's pre, in one decode kernel: (streams', x, post')."""
         from sglang_neuron.backend.stack import wrap_nki
-        from sglang_neuron.models.hy4.kernels.hc_decode import decode_constants, hc_decode
+        from sglang_neuron.models.hy4.kernels.hc_decode import decode_constants, hc_decode, hc_decode_batched
         from sglang_neuron.utils.hardware_config import get_logical_nc_config
 
         cfg = self.config
         n, rows = cfg.hc_mult, self.fn.shape[0]
         t = streams.shape[0]
+        # several tokens a program (a DFly verify's rows): side by side in one pass (75 -> 57 us at 7 rows)
+        kernel = hc_decode_batched if t > 2 else hc_decode
         scale = torch.cat([self.scale[0].expand(n), self.scale[-1].expand(rows - n)]) if rows == 2 * n else \
             self.scale[0].expand(rows)
         ones, place = decode_constants(n, streams.device)
-        new, x, post_next = wrap_nki(hc_decode)[get_logical_nc_config()](
+        new, x, post_next = wrap_nki(kernel)[get_logical_nc_config()](
             streams.reshape(t, -1), out.to(DTYPE), post, self.fn, torch.stack([scale, self.base]).contiguous(), ones,
             place, rms_eps=cfg.rms_norm_eps, hc_eps=cfg.hc_eps, magnitude=cfg.hc_magnitude)
         return new.reshape(streams.shape), x, post_next
@@ -630,7 +637,8 @@ class DecoderLayer(nn.Module):
 class Hy4Graph(nn.Module):
     """One role graph (``phase`` "prefill" or "decode")."""
 
-    def __init__(self, config: Hy4Config, phase: str, hf_config=None):
+    def __init__(self, config: Hy4Config, phase: str, hf_config=None, dfly=None):
+        """``dfly``: the checkpoint's DFly drafter (dfly.DFlyConfig) where the launch serves speculative decoding."""
         super().__init__()
         if phase not in ("prefill", "decode"):
             raise ValueError(f"a role graph is a prefill or a decode, not {phase!r}")
@@ -660,6 +668,12 @@ class Hy4Graph(nn.Module):
         # the KV store's page geometry (kv.py), set by bind_store
         self.kv_block = None
         self.sparse_cap = SPARSE_CAP
+        if dfly is not None:
+            from sglang_neuron.models.hy4.dfly import Drafter
+
+            self.dfly = Drafter(config, dfly, group)
+        else:
+            self.dfly = None
 
     # -- the KV store ------------------------------------------------------------------------------------------------
     def bind_store(self, store) -> None:
@@ -841,6 +855,26 @@ class Hy4Graph(nn.Module):
         """Each head of each query over the rank's compacted selected keys (rows [R, cap]), merged across the ranks."""
         cfg = self.config
         scale, latent = cfg.softmax_scale, cfg.kv_lora_rank
+        if self.phase == "decode" and _NKI_SPARSE_DECODE and query.device.type != "cpu" and rows.shape[0] >= 4:
+            # a multi-row decode (a DFly verify): the prefill's kernel over the rows padded to whole row blocks
+            t = query.shape[0]
+            pad = -t % 4
+            if pad:
+                query = torch.cat([query, query.new_zeros((pad,) + tuple(query.shape[1:]))])
+                rows = torch.cat([rows, rows.new_zeros((pad, rows.shape[1]))])
+                keep = torch.cat([keep, keep.new_zeros((pad, keep.shape[1]))])
+            if _nki_sparse_ok(query, rows):
+                from sglang_neuron.backend.stack import wrap_nki
+                from sglang_neuron.models.hy4.kernels.mla_dense import onehot_rows
+                from sglang_neuron.models.hy4.kernels.mla_sparse import block_slots, mla_sparse
+                from sglang_neuron.utils.hardware_config import get_logical_nc_config
+
+                h, d = query.shape[1], query.shape[2]
+                slots, bias = block_slots(rows, keep, h, cache.shape[0])
+                out, ml = wrap_nki(mla_sparse)[get_logical_nc_config()](
+                    query.to(DTYPE).reshape(-1, 128, d), cache, slots, bias, onehot_rows(h, query.device), scale=scale)
+                return attn.merge_head_major(out[:, :t], ml[:, :t, 0], ml[:, :t, 1])
+            query, rows, keep = query[:t], rows[:t], keep[:t]
         if self.phase != "decode" and _nki_sparse_ok(query, rows):
             # each row block over its tokens' gathered rows in one NKI kernel (kernels/mla_sparse.py)
             from sglang_neuron.backend.stack import wrap_nki
@@ -970,6 +1004,8 @@ class Hy4Graph(nn.Module):
             })
             if moe.shared is not None:
                 mappings.update(_mlp_mappings(f"{m}.shared_experts", f"{dst}.mlp.shared"))
+        if self.dfly is not None:
+            mappings.update(self.dfly.weight_mappings())
         return mappings
 
     def load_weights(self, checkpoint_path: str, device: torch.device) -> None:
