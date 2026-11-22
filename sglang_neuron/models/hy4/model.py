@@ -313,6 +313,7 @@ _NKI_MOE = _NKI and os.environ.get("HY4_NKI_MOE", "1") != "0"
 _MOE_DECODE_V2 = os.environ.get("HY4_MOE_DECODE_V2", "1") != "0"
 _NKI_COMPACT = _NKI and os.environ.get("HY4_NKI_COMPACT", "1") != "0"
 _NKI_HC_DECODE = _NKI and os.environ.get("HY4_NKI_HC_DECODE", "1") != "0"
+_NKI_MOE_BLOCK = _NKI and os.environ.get("HY4_NKI_MOE_BLOCK", "0") == "1"  # off: slower in the served graph so far
 
 
 def _nki_attend_ok(query, rows) -> bool:
@@ -425,6 +426,9 @@ class MoE(nn.Module):
         """``real`` [T] (1 for a real row, 0 for padding): padding rows route to no expert in the prefill (identical
         rows all choose the same experts, which would fill a local expert's blocks with them)."""
         cfg = self.config
+        if (self.phase == "decode" and _NKI_MOE_BLOCK and x.device.type != "cpu" and x.shape[0] <= 32
+                and cfg.num_experts_per_tok == 8 and self.shared is not None and not _ABLATE):
+            return self._block_kernel(x, rank)
         if "moe_route" in _ABLATE:
             experts = torch.zeros(x.shape[0], cfg.num_experts_per_tok, dtype=torch.int64, device=x.device)
             chosen = torch.ones(x.shape[0], cfg.num_experts_per_tok, dtype=torch.float32, device=x.device)
@@ -462,6 +466,22 @@ class MoE(nn.Module):
             h = (F.silu(gate) * up).to(DTYPE)
             out = out + (h @ _dequant(self.down[e], self.down_scale[e])).float() * aff[:, e:e + 1]
         return out.to(DTYPE)
+
+    def _block_kernel(self, x, rank):
+        """The whole decode block (router, choice, routed experts, shared expert) in one NKI kernel
+        (kernels/moe_block.py): the giga kernel's MoE block."""
+        from sglang_neuron.backend.stack import wrap_nki
+        from sglang_neuron.models.hy4.kernels.moe_block import moe_block_decode, shared_gate_up_layout, tile_rows
+        from sglang_neuron.utils.hardware_config import get_logical_nc_config
+
+        cfg = self.config
+        base = (rank.to(torch.int32).reshape(1, 1) * self.num_local).contiguous()
+        out = wrap_nki(moe_block_decode)[get_logical_nc_config()](
+            x.to(DTYPE).t().contiguous(), self.router, self.router_bias.reshape(1, -1), base,
+            tile_rows(x.shape[0], x.device), self.gate_up, self.gate_up_scale, self.down, self.down_scale,
+            shared_gate_up_layout(self.shared.gate_up), self.shared.down, top_k=cfg.num_experts_per_tok,
+            scaling=float(cfg.routed_scaling_factor), limit=float(cfg.swiglu_limit or 3.0e38))
+        return out.sum(0).to(DTYPE)
 
     def _prefill_kernel(self, x, aff):
         """Each local expert over its routed tokens only, in one NKI kernel (kernels/moe_prefill.py)."""
