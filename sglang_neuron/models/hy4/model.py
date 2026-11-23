@@ -346,8 +346,9 @@ _NKI_ATTN_IN = _NKI and os.environ.get("HY4_NKI_ATTN_IN", "0") == "1"  # the dec
 _NKI_ATTN_CORE = _NKI and os.environ.get("HY4_NKI_ATTN_CORE", "0") == "1"  # the decode attention core kernel
 _NKI_LAYER = _NKI and os.environ.get("HY4_NKI_LAYER", "0") == "1"  # a shared decode layer in one kernel
 _NKI_MOE_SUB = _NKI and os.environ.get("HY4_NKI_MOE_SUB", "0") == "1"  # the decode MoE sublayer kernel
-# the decode sublayer's experts sharded TP-n x EP-(ranks / n) (kernels/moe_tp.py), beside the EP layout (0: off)
-_MOE_TP = int(os.environ.get("HY4_MOE_TP", "0")) if _NKI_MOE_SUB or _NKI_LAYER else 0
+# the routed experts sharded TP-n x EP-(ranks / n) instead of EP (kernels/moe_tp.py: the decode sublayer;
+# kernels/moe_prefill_tp.py: the prefill), 0: EP. Needs the decode sublayer kernel (HY4_NKI_MOE_SUB / HY4_NKI_LAYER).
+_MOE_TP = int(os.environ.get("HY4_MOE_TP", "0")) if _NKI else 0
 _NKI_PROJ = _NKI and os.environ.get("HY4_NKI_PROJ", "0") == "1"  # decode q_a / kv_a through kernels/gemv_wide.py
 _NKI_MOE_BLOCK = _NKI and os.environ.get("HY4_NKI_MOE_BLOCK", "0") == "1"  # off: slower in the served graph so far
 
@@ -438,11 +439,16 @@ class MoE(nn.Module):
         e, b = self.num_local, weights.BLOCK
         self.router = nn.Parameter(torch.empty(hidden, config.n_routed_experts, dtype=DTYPE))
         self.router_bias = nn.Parameter(torch.empty(config.n_routed_experts, dtype=torch.float32))
-        # transposed, the contraction first (weights.experts_*_loader): gate columns then up
-        self.gate_up = nn.Parameter(torch.empty(e, hidden, 2 * inner, dtype=torch.float8_e4m3fn))
-        self.gate_up_scale = nn.Parameter(torch.empty(e, hidden // b, 2 * inner // b, dtype=torch.float32))
-        self.down = nn.Parameter(torch.empty(e, inner, hidden, dtype=torch.float8_e4m3fn))
-        self.down_scale = nn.Parameter(torch.empty(e, inner // b, hidden // b, dtype=torch.float32))
+        if not _MOE_TP:
+            # transposed, the contraction first (weights.experts_*_loader): gate columns then up
+            self.gate_up = nn.Parameter(torch.empty(e, hidden, 2 * inner, dtype=torch.float8_e4m3fn))
+            self.gate_up_scale = nn.Parameter(torch.empty(e, hidden // b, 2 * inner // b, dtype=torch.float32))
+            self.down = nn.Parameter(torch.empty(e, inner, hidden, dtype=torch.float8_e4m3fn))
+            self.down_scale = nn.Parameter(torch.empty(e, inner // b, hidden // b, dtype=torch.float32))
+            set_weight_loader(self.gate_up, weights.experts_gate_up_loader())
+            set_weight_loader(self.gate_up_scale, weights.experts_gate_up_scale_loader())
+            set_weight_loader(self.down, weights.experts_down_loader())
+            set_weight_loader(self.down_scale, weights.experts_down_scale_loader())
         self.shared = MLP(config, inner * config.n_shared_experts, tp) if config.n_shared_experts else None
         self.tp = tp
         # the decode MoE sublayer kernel's (kernels/moe_sublayer.py) copies of the router and the shared gate / up,
@@ -467,10 +473,6 @@ class MoE(nn.Module):
                 set_weight_loader(prm, ld)
         set_weight_loader(self.router, weights.transposed())
         set_weight_loader(self.router_bias, weights.as_float())
-        set_weight_loader(self.gate_up, weights.experts_gate_up_loader())
-        set_weight_loader(self.gate_up_scale, weights.experts_gate_up_scale_loader())
-        set_weight_loader(self.down, weights.experts_down_loader())
-        set_weight_loader(self.down_scale, weights.experts_down_scale_loader())
 
     def route(self, x):
         """Each token's top-k experts [T, k] and their weights [T, k] (fp32): sigmoid scores, the bias for the choice
@@ -496,6 +498,8 @@ class MoE(nn.Module):
             experts, chosen = self.route(x)
         if "moe_experts" in _ABLATE:
             return (x * chosen.sum(-1, keepdim=True).to(DTYPE)) + self.shared(x)
+        if _MOE_TP:
+            return self._forward_tp(x, rank, experts, chosen, real)
         first = rank.to(torch.int64).reshape(()) * self.num_local
         local = first + torch.arange(self.num_local, device=x.device)
         # each token's weight on each local expert [T, E], zero off its choices
@@ -508,6 +512,33 @@ class MoE(nn.Module):
             out = self._prefill_kernel(x, aff)
         else:
             out = self._dense(x, aff)
+        if self.shared is not None:
+            out = out + self.shared(x)
+        return out
+
+    def _forward_tp(self, x, rank, experts, chosen, real):
+        """The TP-sharded experts outside the decode sublayer kernel: the prefill (kernels/moe_prefill_tp.py, this
+        rank's slices of its EP group's experts over their routed tokens), plus the shared expert. The partial sums
+        meet in the layer's all-reduce like the EP ones."""
+        from sglang_neuron.backend.stack import wrap_nki
+        from sglang_neuron.models.hy4.kernels.moe_prefill import moe_blocks
+        from sglang_neuron.models.hy4.kernels.moe_prefill_tp import moe_prefill_tp
+        from sglang_neuron.utils.hardware_config import get_logical_nc_config
+
+        t = x.shape[0]
+        if x.device.type == "cpu" or t % 128:
+            raise NotImplementedError(f"HY4_MOE_TP: {t} rows on {x.device} (the TP experts run in the prefill "
+                                      "kernel, 128-row multiples, and the decode sublayer kernel)")
+        first = (rank.to(torch.int64).reshape(()) // _MOE_TP) * self.tp_local
+        local = first + torch.arange(self.tp_local, device=x.device)
+        aff = (chosen[:, :, None] * (experts[:, :, None] == local[None, None, :]).to(torch.float32)).sum(1)
+        if real is not None and self.phase != "decode":
+            aff = aff * real[:, None]
+        tok, tok_out, a, bexp, nblk = moe_blocks(aff)
+        out = wrap_nki(moe_prefill_tp)[get_logical_nc_config()](
+            x.to(DTYPE), tok, tok_out, a, bexp, ((nblk + 1) // 2).to(torch.int32), self.gate_up_tp,
+            self.gate_up_scale_tp, self.down_tp, self.down_scale_tp, limit=float(self.config.swiglu_limit or 3.0e38))
+        out = out.view(2, t, -1).sum(0).to(DTYPE)
         if self.shared is not None:
             out = out + self.shared(x)
         return out
@@ -1179,12 +1210,15 @@ class Hy4Graph(nn.Module):
                 f"{dst}.mlp.router": f"{m}.gate.weight",
                 f"{dst}.mlp.router_pm": f"{m}.gate.weight",
                 f"{dst}.mlp.router_bias": f"{m}.gate.e_score_correction_bias",
-                f"{dst}.mlp.gate_up": [f"{m}.experts.{e}.{p}_proj.weight" for e in local for p in ("gate", "up")],
-                f"{dst}.mlp.gate_up_scale": [f"{m}.experts.{e}.{p}_proj.weight_scale" for e in local
-                                             for p in ("gate", "up")],
-                f"{dst}.mlp.down": [f"{m}.experts.{e}.down_proj.weight" for e in local],
-                f"{dst}.mlp.down_scale": [f"{m}.experts.{e}.down_proj.weight_scale" for e in local],
             })
+            if not _MOE_TP:
+                mappings.update({
+                    f"{dst}.mlp.gate_up": [f"{m}.experts.{e}.{p}_proj.weight" for e in local for p in ("gate", "up")],
+                    f"{dst}.mlp.gate_up_scale": [f"{m}.experts.{e}.{p}_proj.weight_scale" for e in local
+                                                 for p in ("gate", "up")],
+                    f"{dst}.mlp.down": [f"{m}.experts.{e}.down_proj.weight" for e in local],
+                    f"{dst}.mlp.down_scale": [f"{m}.experts.{e}.down_proj.weight_scale" for e in local],
+                })
             if _MOE_TP:
                 grp = range(rank // _MOE_TP * moe.tp_local, (rank // _MOE_TP + 1) * moe.tp_local)
                 mappings.update({
