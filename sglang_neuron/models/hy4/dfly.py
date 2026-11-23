@@ -130,6 +130,8 @@ class Drafter(nn.Module):
         for layer in self.layers:
             a = layer.self_attn
             yield from (a.q_a, a.q_b, a.kv_a, a.w_uk, a.w_uv, a.gate, a.o, layer.mlp.gate_up, layer.mlp.down)
+            if hasattr(a, "qkv_sh"):
+                yield a.qkv_sh
         yield from (self.correction.gate_up, self.correction.down)
 
     def weight_mappings(self) -> dict:
@@ -165,6 +167,8 @@ class Drafter(nn.Module):
                 f"{dst}.mlp.gate_up": fp8(f"{src}.mlp.gate_proj", f"{src}.mlp.up_proj"),
                 f"{dst}.mlp.down": fp8(f"{src}.mlp.down_proj"),
             })
+            if hasattr(self.layers[i].self_attn, "qkv_sh"):
+                m[f"{dst}.self_attn.qkv_sh"] = fp8(f"{a}.q_a_proj", f"{a}.kv_a_proj_with_mqa", f"{a}.linear_gate")
         return m
 
 
@@ -228,8 +232,12 @@ class DFlyStep(nn.Module):
         for layer, (rows, keep), cache in zip(d.layers, states, caches):
             attn = layer.self_attn
             h = layer.input_layernorm(x)
-            query, compact, _ = attn.project(h, cos, sin)
-            _write(cache, write_rows, compact)
+            if hasattr(attn, "qkv_sh") and x.device.type != "cpu" and x.shape[0] <= 8:
+                # the attention input kernel over the sharded q_a / kv_a (kernels/attn_in.py), the cache rows written
+                query, compact, _ = attn.project_fused(x, layer.input_layernorm.weight, cos, sin, cache, write_rows)
+            else:
+                query, compact, _ = attn.project(h, cos, sin)
+                _write(cache, write_rows, compact)
             cap = rows.shape[-1]
             hist = rows.index_select(0, src).to(torch.int64)[:, None, :].expand(b, q, cap)
             hist_keep = keep.index_select(0, src)[:, None, :].expand(b, q, cap)

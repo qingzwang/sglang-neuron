@@ -183,7 +183,7 @@ class Attention(nn.Module):
         self.o = nn.Parameter(torch.empty(heads * config.v_head_dim, hidden, dtype=DTYPE))
         # every head's sink: the merge counts each head's once
         self.sinks = nn.Parameter(torch.empty(config.num_attention_heads, dtype=torch.float32))
-        if _QKV_SH and full is None:  # (a DFly draft layer's attention runs none of the decode kernels)
+        if _QKV_SH:  # (a DFly draft layer's too: dfly.py loads it from its FP8 weights)
             # this rank's q_a / kv_a columns and gate, partition-major (kernels/attn_in.qkv_shard_layout)
             cs = config.q_lora_rank // tp + config.compact_dim // tp + heads * config.v_head_dim
             self.qkv_sh = nn.Parameter(torch.empty(weights.BLOCK, hidden // weights.BLOCK, cs, dtype=DTYPE))
