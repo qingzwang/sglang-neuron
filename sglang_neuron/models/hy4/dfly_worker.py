@@ -32,6 +32,8 @@ logger = logging.getLogger(__name__)
 
 # debug: verify no draft (each step commits one token), for comparing a DFly server's outputs with a plain decode's
 _NO_DRAFTS = __import__("os").environ.get("HY4_DFLY_NO_DRAFTS") == "1"
+# debug: each decode step's host phases (prep, launch, the device wait, post, and the scheduler between steps), logged
+_PROFILE = __import__("os").environ.get("HY4_DFLY_PROFILE") == "1"
 
 
 def worker_reasons(server_args, model) -> list:
@@ -148,6 +150,8 @@ def _worker_class():
             from sglang_neuron.model_executor.async_execution import refuse_invalid_token_ids
             from sglang_neuron.models.hy4.runtime import dfly_inputs
 
+            t_in = time.perf_counter()
+            self._between = False
             rt = self.model._runtime_for("decode")
             q = self.q
             page = int(rt.block_size)
@@ -190,13 +194,16 @@ def _worker_class():
             pad_slots = torch.zeros(b, 2 * q - 1, dtype=torch.int64)
             pad_slots[:n] = torch.from_numpy(ahead)
             kwargs.update(dfly_inputs(bucket, q, pad_cand, pad_base, pad_slots))
+            t_prep = time.perf_counter()
             with DynamicGradMode(), torch.compiler.set_stance("fail_on_recompile"):
                 device_io.before_launch()
                 with device_io.pre_execute_scope():
                     out = rt.compiled(**kwargs)
                 event = device_io.after_launch()
+            t_launch = time.perf_counter()
             tokens, accepted, drafts = device_io.readback_many(
                 [out["token_ids"], out["dfly_accepted"], out["dfly_drafts"]], event)
+            t_read = time.perf_counter()
             tokens = tokens[:rows].to(torch.int64).view(n, q)
             refuse_invalid_token_ids(tokens.reshape(-1), rt.vocab_size)
             accepted = accepted[:n].to(torch.int64)
@@ -206,6 +213,9 @@ def _worker_class():
             for i, req in enumerate(batch.reqs):
                 self.drafts[req.rid] = (int(new_lens[i]), drafts[i])
             self._log(n, int(accepted.sum()), cand)
+            if _PROFILE:
+                self._prof(t_in, t_prep, t_launch, t_read, int(accepted.sum()))
+                self._between = True
             out_tokens = tokens.clone()
             out_tokens[torch.arange(q)[None, :] > accepted[:, None]] = -1
             return GenerationBatchResult(
@@ -214,6 +224,53 @@ def _worker_class():
                 next_draft_input=make_draft_input_v2(bonus_tokens=tokens.gather(1, accepted[:, None])[:, 0],
                                                      new_seq_lens=new_lens),
                 speculative_num_draft_tokens=q, new_seq_lens=new_lens, can_run_cuda_graph=False)
+
+        def _sampler(self):
+            """HY4_DFLY_PROFILE: a thread sampling the scheduler thread's stack every ms between decode steps."""
+            import collections
+            import sys
+            import threading
+
+            main = threading.main_thread().ident
+            self._between = False
+            self._hits = collections.Counter()
+
+            def run():
+                while True:
+                    time.sleep(0.001)
+                    if not self._between:
+                        continue
+                    f = sys._current_frames().get(main)
+                    seen = set()
+                    while f is not None:
+                        c = f.f_code
+                        k = f"{c.co_filename.split('/')[-1]}:{c.co_name}"
+                        if k not in seen:
+                            self._hits[k] += 1
+                            seen.add(k)
+                        f = f.f_back
+
+            threading.Thread(target=run, daemon=True).start()
+
+        def _prof(self, t_in, t_prep, t_launch, t_read, acc) -> None:
+            if not hasattr(self, "_hits"):
+                self._sampler()
+            st = self.__dict__.setdefault("_pst", {"n": 0, "acc": 0, "prep": 0.0, "launch": 0.0, "wait": 0.0,
+                                                    "post": 0.0, "between": 0.0, "out": None})
+            now = time.perf_counter()
+            if st["out"] is not None:
+                st["between"] += t_in - st["out"]
+            st["n"] += 1; st["acc"] += acc
+            st["prep"] += t_prep - t_in; st["launch"] += t_launch - t_prep; st["wait"] += t_read - t_launch
+            st["post"] += now - t_read
+            st["out"] = now
+            if st["n"] == 64:
+                logger.info("Hy4 DFly profile (ms a step, 64 steps, accepted %.2f): prep %.2f launch %.2f wait %.2f "
+                            "post %.2f between steps %.2f", st["acc"] / 64,
+                            *(st[k] * 1e3 / 64 for k in ("prep", "launch", "wait", "post", "between")))
+                st.update(n=0, acc=0, prep=0.0, launch=0.0, wait=0.0, post=0.0, between=0.0)
+                logger.info("Hy4 DFly profile between steps (samples): %s", self._hits.most_common(40))
+                self._hits.clear()
 
         def _log(self, n: int, accepted: int, cand) -> None:
             self.steps += 1
