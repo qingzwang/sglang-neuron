@@ -205,6 +205,9 @@ class Attention(nn.Module):
             self.idx_w = nn.Parameter(torch.empty(hidden, ih, dtype=DTYPE))
             for p in (self.idx_q, self.idx_k, self.idx_w):
                 set_weight_loader(p, weights.transposed())
+            if _IDXQ_SH:
+                self.idx_q_sh = nn.Parameter(torch.empty(config.q_lora_rank, ih * idim // tp, dtype=DTYPE))
+                set_weight_loader(self.idx_q_sh, weights.column_shard(ih * idim // tp))
             set_weight_loader(self.idx_k_norm_weight, weights.as_float())
             set_weight_loader(self.idx_k_norm_bias, weights.as_float())
         # bound by bind_store: this layer's latent rows [rows, compact] and, on a full layer, index keys [rows, idim]
@@ -256,12 +259,15 @@ class Attention(nn.Module):
             qkv_sh=getattr(self, "qkv_sh", None))
         return q, compact, q_lat
 
-    def index_project(self, x, q_lat, cos, sin):
+    def index_project(self, x, q_lat, cos, sin, decode: bool = False):
         """The indexer's queries [T, ih, idim] and head weights [T, ih] (fp32), and the tokens' index keys [T, idim]."""
         cfg = self.config
         t = x.shape[0]
         ih, idim, rope = cfg.index_n_heads, cfg.index_head_dim, cfg.qk_rope_head_dim
-        q = (q_lat @ self.idx_q).view(t, ih, idim)
+        if decode and _IDXQ_SH:
+            q = self.group.all_gather(q_lat @ self.idx_q_sh, -1).view(t, ih, idim)
+        else:
+            q = (q_lat @ self.idx_q).view(t, ih, idim)
         # the checkpoint's indexer rotates the last rope channels of each head
         q = torch.cat([q[..., :idim - rope], rotate(q[..., idim - rope:], cos, sin)], dim=-1)
         k = F.layer_norm((x @ self.idx_k).float(), (idim,), self.idx_k_norm_weight, self.idx_k_norm_bias,
@@ -355,6 +361,9 @@ _QKV_SH = _NKI_ATTN_IN and os.environ.get("HY4_QKV_SH", "0") == "1"
 # the decode indexer's scores in one NKI kernel a request (kernels/index_scores.py index_scores_decode): a DFly
 # verify's rows share their keys, gathered once
 _NKI_INDEX_DECODE = _NKI and os.environ.get("HY4_NKI_INDEX_DECODE", "0") == "1"
+# the decode indexer's query projection sharded over the attention TP (an all-gather of [T, ih idim / tp] slices)
+# instead of the replicated idx_q (16 MB bf16 a full layer); the prefill keeps the replicated one
+_IDXQ_SH = os.environ.get("HY4_IDXQ_SH", "0") == "1"
 _NKI_ATTN_CORE = _NKI and os.environ.get("HY4_NKI_ATTN_CORE", "0") == "1"  # the decode attention core kernel
 _NKI_LAYER = _NKI and os.environ.get("HY4_NKI_LAYER", "0") == "1"  # a shared decode layer in one kernel
 _NKI_MOE_SUB = _NKI and os.environ.get("HY4_NKI_MOE_SUB", "0") == "1"  # the decode MoE sublayer kernel
@@ -898,7 +907,7 @@ class Hy4Graph(nn.Module):
                 rows = key_rows[:, :self.sparse_cap] if self.phase == "decode" else key_rows[0][:self.sparse_cap][None].expand(x.shape[0], -1)
                 state = (rows, torch.ones_like(rows, dtype=torch.bool))
         elif attn.full:
-            iq, iw, ik = attn.index_project(x, q_lat, cos, sin)
+            iq, iw, ik = attn.index_project(x, q_lat, cos, sin, decode=self.phase == "decode")
             _write(index_cache, write_rows, ik)
             # (not in the prologue's layer 0: its program got slower with it, 6.3 -> ~10 ms at 512K)
             selected, scores = self._select(index_cache, iq, iw, key_rows, valid, kernel_ok=attn.layer_idx > 0)
@@ -1019,7 +1028,7 @@ class Hy4Graph(nn.Module):
                 wb = torch.cat([iw[b * q:(b + 1) * q], iw.new_zeros(tp - q, ih)]).to(torch.float32).reshape(-1, 128)
                 keys = cache[key_rows[b * q]]  # [K, idim]
                 parts.append(wrap_nki(index_scores_decode)[get_logical_nc_config()](
-                    qb.t().contiguous(), keys.t().contiguous(), wb, mask)[:q])
+                    qb.t().contiguous(), keys, wb, mask)[:q])
             scores = torch.cat(parts) if len(parts) > 1 else parts[0]
         elif self.phase == "decode":
             keys = cache[key_rows].float()  # [B, keys, idim]
@@ -1229,6 +1238,7 @@ class Hy4Graph(nn.Module):
             if layer.self_attn.full:
                 mappings.update({
                     f"{dst}.self_attn.idx_q": f"{a}.indexer.wq_b.weight",
+                    **({f"{dst}.self_attn.idx_q_sh": f"{a}.indexer.wq_b.weight"} if _IDXQ_SH else {}),
                     f"{dst}.self_attn.idx_k": f"{a}.indexer.wk.weight",
                     f"{dst}.self_attn.idx_k_norm_weight": f"{a}.indexer.k_norm.weight",
                     f"{dst}.self_attn.idx_k_norm_bias": f"{a}.indexer.k_norm.bias",

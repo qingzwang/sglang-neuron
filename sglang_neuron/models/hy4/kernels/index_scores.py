@@ -77,14 +77,15 @@ def placement_mask(heads: int, device=None):
     return (c == (P // heads) * j + p // heads).to(torch.bfloat16)
 
 
-def index_scores_decode(qT, keysT, w, mask):
+def index_scores_decode(qT, keys_rm, w, mask):
     """The decode's scores of a request's rows (a DFly verify's rows share their keys): qT [128, Tp * heads] bf16
-    (column t * heads + h, Tp = 128 / heads * NB); keysT [128, K] bf16; w [Tp * heads / 128, 128] fp32; mask
+    (column t * heads + h, Tp = 128 / heads * NB); keys_rm [K, 128] bf16 (as gathered: transposed here, on the
+    tensor engine, instead of an XLA transpose: ~80 us at 8192 keys); w [Tp * heads / 128, 128] fp32; mask
     [128, NB, Tp] bf16 (placement_mask_decode) -> scores [Tp, K] fp32. Each 512-key tile: NB matmuls of 128 (token,
     head) query rows against the keys, the relu on the way out of PSUM, and NB matmuls of the placed weights summing
     each token's heads into [Tp, 512]; the two programs take alternate key tiles."""
     D, NQ = qT.shape
-    _, K = keysT.shape
+    K, _ = keys_rm.shape
     _, NB, Tp = mask.shape
     n_prg = nl.num_programs(axes=0)
     pid = nl.program_id(axis=0)
@@ -100,11 +101,19 @@ def index_scores_decode(qT, keysT, w, mask):
         nisa.tensor_scalar(dst=wb[0:P, j, 0:Tp], data=msk[0:P, j, 0:Tp], op0=nl.multiply, operand0=wt[0:P, j:j + 1])
     NT = K // KEY_TILE
     NH = -(-NT // n_prg)  # this program's tiles
-    keys = nl.ndarray((P, NH, KEY_TILE), dtype=keysT.dtype, buffer=nl.sbuf)
+    SUB = KEY_TILE // P
+    keys = nl.ndarray((P, NH, KEY_TILE), dtype=keys_rm.dtype, buffer=nl.sbuf)  # [dim, tile, key]
     tiles = list(range(pid, NT, n_prg))
     for i, kt in enumerate(tiles):
-        nisa.dma_copy(dst=keys[0:P, i, 0:KEY_TILE], src=keysT.ap(pattern=[[K, P], [1, KEY_TILE]], offset=kt * KEY_TILE),
+        kr = nl.ndarray((P, SUB, P), dtype=keys_rm.dtype, buffer=nl.sbuf)  # kr[p, s, :] = key 512 kt + 128 s + p
+        nisa.dma_copy(dst=kr[0:P, 0:SUB, 0:P], src=keys_rm.ap(pattern=[[P, P], [P * P, SUB], [1, P]],
+                                                                offset=kt * KEY_TILE * P),
                       dge_mode=nisa.dge_mode.hwdge, engine=(nisa.engine.sync, nisa.engine.scalar)[i % 2])
+        for sb in range(SUB):
+            tp = nl.ndarray((P, P), dtype=nl.bfloat16, buffer=nl.psum)
+            nisa.nc_transpose(dst=tp[0:P, 0:P], data=kr[0:P, sb, 0:P])
+            nisa.tensor_copy(dst=keys[0:P, i, sb * P:(sb + 1) * P], src=tp[0:P, 0:P],
+                             engine=nisa.scalar_engine if sb % 2 else nisa.vector_engine)
     o = nl.ndarray((Tp, NH, KEY_TILE), dtype=nl.float32, buffer=nl.sbuf)
     for i, kt in enumerate(tiles):
         acc = nl.ndarray((Tp, KEY_TILE), dtype=nl.float32, buffer=nl.psum)
