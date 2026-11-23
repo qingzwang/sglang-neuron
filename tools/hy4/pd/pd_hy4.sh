@@ -4,6 +4,10 @@
 source /mnt/nvme/work/hy4/env.sh
 export PYTHONPATH=/mnt/nvme/work/nixl_overlay:$PYTHONPATH; unset NIXL_PLUGIN_DIR
 export SGLANG_DISAGGREGATION_NIXL_BACKEND=LIBFABRIC NEURON_RT_VISIBLE_CORES=0-63
+# long-context prefill is the bottleneck at concurrency (4 cold 128-380K sessions queue ~9 min of prefill): SGLang's
+# 300 s defaults made the decode give up on a request still queued on the prefill ("timed out after 300.0s in
+# KVPoll.WaitingForInput"); an aggregated server just queues it
+export SGLANG_DISAGGREGATION_WAITING_TIMEOUT=${PD_WAIT_TIMEOUT:-3600} SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=${PD_WAIT_TIMEOUT:-3600}
 export HY4_NKI_MOE_SUB=1 HY4_HC_CHAIN=1 HY4_NKI_ATTN_IN=1 HY4_MOE_TP=16 HY4_NKI_ATTN_CORE=1 HY4_NKI_LAYER=1 \
   HY4_QKV_SH=1 HY4_NKI_INDEX_DECODE=1 HY4_IDXQ_SH=1 ${HY4_EXTRA:-}
 C=/mnt/nvme/work/hy4/cache_pd_$1_$(cat /mnt/nvme/sglang-neuron/sglang_neuron/models/hy4/kernels/*.py | md5sum | cut -c1-8)

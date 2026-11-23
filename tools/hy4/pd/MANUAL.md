@@ -206,26 +206,74 @@ B=mooncake   # 或 nixl
   python tests/dfly_check.py 8000 /mnt/nvme/check.json 128'
 ```
 
-本次（NIXL）：6 条输出与单机逐字相同，DFly 接受长度相同（2.61 3.87 2.78 6.73 2.56 6.4）——
-`results_hy4_1p1d/`。Mooncake：见 §9 前的结果补充。
+本次：NIXL 与 Mooncake 两个后端的 6 条输出都与单机逐字相同，DFly 接受长度相同（2.61 3.87 2.78 6.73 2.56 6.4），
+请求耗时一致（`results_hy4_1p1d/`、`results_hy4_1p1d_mooncake/`）。
+
+确认确实走 Mooncake 的 EFA transport（而不是退回 TCP）：
+
+```bash
+./pd.sh both 'L=/mnt/nvme/prefill.log; grep -o "disaggregation_transfer_backend.\{0,14\}" $L | head -1;
+  grep "protocol: efa" $L | head -1;                       # transfer engine 日志
+  p=$(pgrep -f "sglang::scheduler" | head -1); tr "\0" "\n" < /proc/$p/environ | grep -E "MOONCAKE_PROTOCOL|NEURON_RT_MAP_HBM"'
+# EFA 硬件计数器：每张 EFA 卡都有 RDMA write 字节数
+./pd.sh prefill 'cat /sys/class/infiniband/*/ports/1/hw_counters/rdma_write_bytes'
+```
 
 小模型验证（先确认链路）：Qwen3-0.6B 1P1D（`pd_qwen.sh`，examples/qwen3_0p6b），17×23 得 `\boxed{391}`，GSM8K 前
 100 题 0.44（`results_qwen06_1p1d/`）。
 
 ## 9. 跑 AgentX
 
-`agentx_pd2.sh`（开发机上运行；每个并发点重启两边服务，起 balancer，客户端指向 balancer）：
+按 agentx-bench 的规范（`CONTRIBUTING.md`）：
+
+- **每个并发点重新部署服务**：停掉上一轮的 balancer / prefill / decode（以及残留的 `sglang::` 进程），重新启动、
+  等 `/health`，再起 balancer、跑客户端。不要在热服务上连跑多个并发，也不要手动清缓存。
+- 每个点固定 3600 s 测量（另有 warmup 和 drain，单点 1–1.5 小时），种子 42，用 `client/run_point.sh` 的默认值。
+- 错误率 ≤ 10%（客户端会校验）。
+- **TP 字段填芯片数**：trn2.48xlarge 是 16 颗芯片，LNC=2 下 Neuron TP64 填 `TP=16`。真实的 Neuron TP / EP / LNC
+  写在 metadata 的 `notes` 里。填错了不必重跑：改好 point env，用 `client/import_point.sh <point.env>
+  <run>/results/aiperf_artifacts <run>/client.log` 重新导入。
+
+`agentx_pd2.sh`（在开发机上运行，客户端也在开发机上；每个点按上面的流程重部署两边服务）：
 
 ```bash
 PD_BACKEND=mooncake CONCS="1 4" nohup ./agentx_pd2.sh > agentx_pd.out 2>&1 &
+# 单机对照（同一 trace）：开发机上 trn2_agentx_dfly.sh，同样每个点重启服务
 ```
 
-point env 中 PD 需要的字段：`DISAGG=true`、`KV_P2P_TRANSFER=<backend>`、`PREFILL_NUM_WORKERS=1`、
-`PREFILL_TP=64`、`DECODE_NUM_WORKERS=1`、`DECODE_TP=64`、`DECODE_EP=64`；
-`SERVER_METRICS_URLS=http://<prefill>:30000/metrics,http://<decode>:30001/metrics`（逗号分隔，两边都抓：prefix
-cache 命中发生在 prefill）。
+PD point env 的关键字段：
 
-结果：（待补充）
+```
+SERVER_URL=http://<prefill ip>:8000                     # balancer
+SERVER_METRICS_URLS=http://<prefill ip>:30000/metrics,http://<decode ip>:30001/metrics   # 逗号分隔，两边都抓
+DISAGG=true
+KV_P2P_TRANSFER=mooncake
+PREFILL_NUM_WORKERS=1  PREFILL_TP=16  PREFILL_EP=16
+DECODE_NUM_WORKERS=1   DECODE_TP=16   DECODE_EP=16
+TP=16 EP=16 PP=1 DCP=1 PCP=1                            # DISAGG=true 时 PP/DCP/PCP 必须为 1
+```
+
+进度监控：客户端日志里 `Phase warmup ... started/complete`、`Phase profiling ... started`（开始 3600 s）、
+`Validated aiperf request error rate`、`Point complete`；服务端看 decode 日志的 `Hy4 DFly: ... last 64 steps`、
+prefill 日志的 `Prefill batch`，以及两边的 `Decode transfer failed` / `Traceback`。KV 传输耗时在 metrics 里：
+`sglang:kv_transfer_latency_ms`、`kv_transfer_total_mb`、`kv_transfer_speed_gb_s`（aiperf 的
+`server_metrics_export.json`）。
+
+结果（`results_agentx/`，每个点 0% 错误）：
+
+| AgentX | 单机 c1 | PD c1 | 单机 c4 | PD c4 |
+|---|---|---|---|---|
+| output tok/s | 24.7 | 24.7 | 32.9 | **36.9** |
+| ITL avg / p50 / p90 (ms) | 33.5 / 28.2 / 42.3 | 29.8 / 26.4 / 37.5 | 102.3 / 88.0 / 126.6 | **73.1 / 73.9 / 101.1** |
+| TTFT avg / p50 / p90 (s) | 8.0 / 3.6 / 16.8 | 8.2 / 4.2 / 15.7 | 22.1 / 4.8 / 62.8 | **16.6 / 4.6 / 39.7** |
+| request latency avg / p90 (s) | 39.5 / 95.8 | 36.7 / 83.7 | 96.1 / 293.5 | **78.2 / 248.0** |
+| 芯片数 | 16 | 32 | 16 | 32 |
+
+- conc1 时 PD 几乎没有收益（只有一个会话，prefill 很少和 decode 争抢）。
+- conc4 时 decode 不再被其他会话的长 prefill 阻塞：ITL 降 20–29%，TTFT p90 降 37%，请求延迟降 19%；但用了两倍
+  芯片，每芯片吞吐更低。
+- KV 传输不是瓶颈：c1 平均 145 ms（每 rank 约 273 MB，64 个 rank 合计约 160 GB/s），c4 平均 328 ms；TTFT 主要是
+  prefill 算力（每个 1024-token chunk 约 1.2 s）。
 
 ## 10. 问题排查
 
@@ -240,6 +288,10 @@ cache 命中发生在 prefill）。
 | AgentX warmup 全部 400："requires temperature=0 or top_k=1 ... SAMPLER=greedy" | prefill 用了 greedy sampler | 两边都 `SGLANG_NEURON_SAMPLER=topk_topp`（AGENTX=1） |
 | 启动报 "the compile cache ... was built from other NKI kernel sources" | 同步了插件文件，缓存戳不匹配（Hy4 kernel 没变） | 启动前 `python -m sglang_neuron.backend.compile_cache stamp <dir>` |
 | prefill chunk 4096 / 2048 OOM（`NRT_RESOURCE`） | 512K context + 3.1M pool 占满 HBM | 保持 1024（更大 chunk 也不更快，prefill 是算力瓶颈） |
+| decode："Request ... timed out after 300.0s in KVPoll.WaitingForInput" | 并发时多个冷会话在单个 prefill 上排队（4 × 128–380K token，约 9 分钟），超过 SGLang 默认 300 s | `SGLANG_DISAGGREGATION_WAITING_TIMEOUT` / `..._BOOTSTRAP_TIMEOUT` 设为 3600（pd_hy4.sh 已设） |
+| Mooncake 启动被拒："the model (...) moves its KV with NIXL only" | #1 只放行 Qwen3 / Qwen3-MoE / GLM-4 | 把模型包加入 `disaggregation/mooncake.py` 的 `SERVED_PACKAGES`（Hy4 已加） |
+| `pkill -f <模式>` 把自己的 shell 也杀了（exit 144） | 模式出现在自己的命令行里 | 按 PID 杀，或用 `ps ... \| awk` 过滤掉自己 |
+| AgentX 点名 / 每芯片指标不对 | TP 字段填了软件 TP（64） | 填芯片数（16），用 `import_point.sh` 重新导入 |
 
 ## 11. 清理
 

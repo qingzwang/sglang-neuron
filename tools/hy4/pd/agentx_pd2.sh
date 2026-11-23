@@ -1,6 +1,6 @@
 #!/bin/bash
 # agentx_pd.sh: AgentX points against the Hy4 1P1D pair (pd_hy4.sh AGENTX=1), the client on this dev node; fresh
-# servers per point. CONCS (default "1 4"), OUT.
+# servers per point (agentx-bench: fresh_server_per_point; TP/EP fields count chips: Neuron TP64 at LNC2 = 16 chips). CONCS (default "1 4"), OUT.
 set -u
 H=/mnt/nvme/work/hy4; OUT=${OUT:-/mnt/nvme/work/agentx-results-trn2/dfly_pd_${PD_BACKEND:-nixl}}; mkdir -p $OUT
 PF=172.31.42.175; DC=172.31.37.223
@@ -26,8 +26,8 @@ HARDWARE=trn2
 FRAMEWORK=sglang
 PRECISION=fp8
 IMAGE=sglang-neuron-local
-TP=64
-EP=64
+TP=16
+EP=16
 PP=1
 DCP=1
 PCP=1
@@ -36,10 +36,11 @@ SPEC_DECODING=dfly
 DISAGG=true
 KV_P2P_TRANSFER=${PD_BACKEND:-nixl}
 PREFILL_NUM_WORKERS=1
-PREFILL_TP=64
+PREFILL_TP=16
+PREFILL_EP=16
 DECODE_NUM_WORKERS=1
-DECODE_TP=64
-DECODE_EP=64
+DECODE_TP=16
+DECODE_EP=16
 KV_OFFLOADING=none
 CONC=$CONC
 OUTPUT_ROOT=$OUT
