@@ -33,6 +33,9 @@ SERVED_PACKAGES = (
     "sglang_neuron.models.qwen3",
     "sglang_neuron.models.qwen3_moe",
     "sglang_neuron.models.glm4",
+    # Hy4's context-parallel store (models/hy4/kv.py): every layer's MLA rows and each full layer's index keys, a
+    # page's rows one run a rank, entries paired by their kv_layer_ids; prefill and decode at the same attention TP
+    "sglang_neuron.models.hy4",
 )
 # libfabric loads its Neuron HMEM support from the Neuron SDK's libraries
 NEURON_LIB_DIR = "/opt/aws/neuron/lib"
