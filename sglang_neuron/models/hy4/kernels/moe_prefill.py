@@ -166,14 +166,16 @@ def moe_prefill_fp8(x, tok, tok_out, aff, bexp, nblk, gate_up, gate_up_scale, do
     return out
 
 
-def moe_blocks(aff, P: int = 128):
+def moe_blocks(aff, P: int = 128, top_k: int = 0):
     """The block list of ``moe_prefill_fp8`` from the routing weights ``aff`` [T, E] (zero off a token's experts), in
     torch (the caller's graph): (tok [NB, P], tok_out [NB, 2, P], aff [NB, P], bexp [NB, 1], nblk [1, 1]). Expert e's
-    routed tokens fill ceil(count_e / P) consecutive blocks; NB = T E / P + E bounds the blocks of any routing."""
+    routed tokens fill ceil(count_e / P) consecutive blocks; NB = T E / P + E bounds the blocks of any routing.""" 
     import torch
 
     T, E = aff.shape
-    NB = T * E // P + E
+    # (with ``top_k``: a token routes to at most top_k of the E experts, so the blocks are bounded by T min(k, E) / P
+    # + E; the block list's gathers scale with NB: 576 -> 128 blocks for the TP layout's 64 local experts)
+    NB = T * (min(top_k, E) if top_k else E) // P + E
     routed = aff > 0
     count = routed.sum(0)
     nbe = (count + P - 1) // P

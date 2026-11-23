@@ -562,7 +562,7 @@ class MoE(nn.Module):
             xp = torch.cat([xp, xp.new_zeros((pad, xp.shape[1]))])
             aff = torch.cat([aff, aff.new_zeros((pad, aff.shape[1]))])
         tp_ = t + pad
-        tok, tok_out, a, bexp, nblk = moe_blocks(aff)
+        tok, tok_out, a, bexp, nblk = moe_blocks(aff, top_k=self.config.num_experts_per_tok)
         out = wrap_nki(moe_prefill_tp)[get_logical_nc_config()](
             xp, tok, tok_out, a, bexp, ((nblk + 1) // 2).to(torch.int32), self.gate_up_tp,
             self.gate_up_scale_tp, self.down_tp, self.down_scale_tp, limit=float(self.config.swiglu_limit or 3.0e38))

@@ -281,6 +281,9 @@ class StagedStep:
         group), flattened in argument order, for profiling the group program with real inputs (prof_nx)."""
         import numpy as np
 
+        streams = args[3]
+        if streams.shape[0] < int(os.environ.get("HY4_DUMP_MIN_ROWS", "0")):
+            return  # (e.g. a prefill dump skipping the warmup's small calls)
         n = self.__dict__.setdefault("_dump_steps", 0) + 1
         self._dump_steps = n
         if n != int(os.environ.get("HY4_DUMP_AT", "200")) or int(self.graph.group.coordinator.rank_in_group) != 0:
@@ -330,7 +333,7 @@ class StagedStep:
         states = {}
         for gi, (params, attns) in enumerate(zip(self.group_params, self.group_caches)):
             index_cache = [a.index_cache for a in attns if a.full]
-            if _DUMP and gi == 9 and self.graph.phase == "decode":
+            if _DUMP and gi == 9 and self.graph.phase == os.environ.get("HY4_DUMP_PHASE", "decode"):
                 self._dump_group((params, [a.cache for a in attns], index_cache, streams, step, state, rank))
             streams, state = self.group(params, [a.cache for a in attns], index_cache, streams, step, state, rank)
             states[gi] = state
