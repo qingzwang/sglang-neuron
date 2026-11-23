@@ -26,9 +26,10 @@ from sglang_neuron.model_executor.graph_runner import NeuronModelRuntime
 
 logger = logging.getLogger(__name__)
 
-# the layers the prologue runs; after them the layers repeat in groups of GROUP (three shared, then a full one)
+# the layers the prologue runs; after them the layers repeat in groups of GROUP (three shared, then a full one, the
+# pattern HY4_GROUP / 4 times: a bigger group is fewer program launches a step)
 PROLOGUE_LAYERS = 2
-GROUP = 4
+GROUP = int(os.environ.get("HY4_GROUP", "4"))
 
 
 def group_layout(config) -> list:
@@ -98,8 +99,11 @@ class _Group(nn.Module):
         pending = None
         last = len(self.layers) - 1
         for j, layer in enumerate(self.layers):
-            r = g.run_layer(layer, caches[j], index_cache if layer.self_attn.full else None, streams, step, state, rank,
-                            pending=pending, defer=chain and j < last)
+            ic = None
+            if layer.self_attn.full:  # each full layer's own index cache, in order
+                ic, index_cache = index_cache[0], index_cache[1:]
+            r = g.run_layer(layer, caches[j], ic, streams, step, state, rank, pending=pending,
+                            defer=chain and j < last)
             if chain and j < last:
                 streams, state, pending = r
             else:
@@ -242,7 +246,7 @@ class StagedStep:
         t1 = time.perf_counter()
         states = {}
         for gi, (params, attns) in enumerate(zip(self.group_params, self.group_caches)):
-            index_cache = next(a.index_cache for a in attns if a.full)
+            index_cache = [a.index_cache for a in attns if a.full]
             streams, state = self.group(params, [a.cache for a in attns], index_cache, streams, step, state, rank)
             states[gi] = state
         sync(streams)
@@ -325,7 +329,7 @@ class StagedStep:
             logger.info("Hy4 debug prologue streams %s", _norms(streams))
         states = {}
         for gi, (params, attns) in enumerate(zip(self.group_params, self.group_caches)):
-            index_cache = next(a.index_cache for a in attns if a.full)
+            index_cache = [a.index_cache for a in attns if a.full]
             if _DUMP and gi == 9 and self.graph.phase == "decode":
                 self._dump_group((params, [a.cache for a in attns], index_cache, streams, step, state, rank))
             streams, state = self.group(params, [a.cache for a in attns], index_cache, streams, step, state, rank)
