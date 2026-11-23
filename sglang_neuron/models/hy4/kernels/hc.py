@@ -59,18 +59,20 @@ def hc_pre(streams, fnc, affine, rms_eps=1e-6, hc_eps=1e-6, magnitude=1.0):
         rinv = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
         nisa.activation(dst=rinv[0:P, 0:1], op=nl.rsqrt, data=ms[0:P, 0:1])
         # the mixes [128 tokens, R] on the tensor engine
-        mx = nl.ndarray((P, R), dtype=nl.float32, buffer=nl.psum)
+        mx = nl.ndarray((P, 2 * R), dtype=nl.float32, buffer=nl.psum)
         for c in range(FC):
             tp = nl.ndarray((P, P), dtype=nl.bfloat16, buffer=nl.psum)
             nisa.nc_transpose(dst=tp[0:P, 0:P], data=st[0:P, c * P:(c + 1) * P])
             sT = nl.ndarray((P, P), dtype=nl.bfloat16, buffer=nl.sbuf)
             nisa.tensor_copy(dst=sT[0:P, 0:P], src=tp[0:P, 0:P],
                              engine=nisa.scalar_engine if c % 2 else nisa.vector_engine)
-            # fn's hi, then lo half, accumulated in place (one stationary load)
-            nisa.nc_matmul(dst=mx[0:P, 0:R], stationary=sT[0:P, 0:P], moving=fn[0:P, c, 0:R], accumulate=(c > 0))
-            nisa.nc_matmul(dst=mx[0:P, 0:R], stationary=sT[0:P, 0:P], moving=fn[0:P, c, R:2 * R], accumulate=True)
+            # fn's hi and lo halves in one matmul (a matmul costs the same at 8 or 16 columns), summed after
+            nisa.nc_matmul(dst=mx[0:P, 0:2 * R], stationary=sT[0:P, 0:P], moving=fn[0:P, c, 0:2 * R],
+                           accumulate=(c > 0))
+        mx2 = nl.ndarray((P, 2 * R), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=mx2[0:P, 0:2 * R], src=mx[0:P, 0:2 * R])
         mix = nl.ndarray((P, R), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_copy(dst=mix[0:P, 0:R], src=mx[0:P, 0:R])
+        nisa.tensor_tensor(dst=mix[0:P, 0:R], data1=mx2[0:P, 0:R], data2=mx2[0:P, R:2 * R], op=nl.add)
         # z = mix / rms * scale + base; gates = sigmoid(z)
         nisa.tensor_scalar(dst=mix[0:P, 0:R], data=mix[0:P, 0:R], op0=nl.multiply, operand0=rinv[0:P, 0:1])
         nisa.tensor_tensor(dst=mix[0:P, 0:R], data1=mix[0:P, 0:R], data2=aff[0:P, 0, 0:R], op=nl.multiply)
