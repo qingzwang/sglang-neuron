@@ -30,6 +30,7 @@ def mla_sparse(q, cache, rows, bias, onehot, scale=1.0, tag=""):
     fp32), with S a multiple of 512, at most 2048, and L = 512."""
     NB, _, D = q.shape
     S = rows.shape[1]
+    assert S % KEY_TILE == 0 and S <= 2048, f"mla_sparse: {S} slots a block (a multiple of {KEY_TILE}, at most 2048)"
     TPB = bias.shape[1]
     H = P // TPB
     T = NB * TPB

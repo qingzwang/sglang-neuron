@@ -547,19 +547,26 @@ class MoE(nn.Module):
         from sglang_neuron.utils.hardware_config import get_logical_nc_config
 
         t = x.shape[0]
-        if x.device.type == "cpu" or t % 128:
-            raise NotImplementedError(f"HY4_MOE_TP: {t} rows on {x.device} (the TP experts run in the prefill "
-                                      "kernel, 128-row multiples, and the decode sublayer kernel)")
+        if x.device.type == "cpu":
+            raise NotImplementedError("HY4_MOE_TP: the TP experts run on the device kernels only")
         first = (rank.to(torch.int64).reshape(()) // _MOE_TP) * self.tp_local
         local = first + torch.arange(self.tp_local, device=x.device)
         aff = (chosen[:, :, None] * (experts[:, :, None] == local[None, None, :]).to(torch.float32)).sum(1)
         if real is not None and self.phase != "decode":
             aff = aff * real[:, None]
+        xp = x.to(DTYPE)
+        pad = -t % 128
+        if pad:
+            # a decode batch beyond the sublayer kernel's 8 rows (e.g. 4 requests' DFly verify): padded rows route
+            # to no expert
+            xp = torch.cat([xp, xp.new_zeros((pad, xp.shape[1]))])
+            aff = torch.cat([aff, aff.new_zeros((pad, aff.shape[1]))])
+        tp_ = t + pad
         tok, tok_out, a, bexp, nblk = moe_blocks(aff)
         out = wrap_nki(moe_prefill_tp)[get_logical_nc_config()](
-            x.to(DTYPE), tok, tok_out, a, bexp, ((nblk + 1) // 2).to(torch.int32), self.gate_up_tp,
+            xp, tok, tok_out, a, bexp, ((nblk + 1) // 2).to(torch.int32), self.gate_up_tp,
             self.gate_up_scale_tp, self.down_tp, self.down_scale_tp, limit=float(self.config.swiglu_limit or 3.0e38))
-        out = out.view(2, t, -1).sum(0).to(DTYPE)
+        out = out.view(2, tp_, -1).sum(0)[:t].to(DTYPE)
         if self.shared is not None:
             out = out + self.shared(x)
         return out

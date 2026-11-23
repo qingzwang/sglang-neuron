@@ -178,6 +178,12 @@ def _loader_of(p):
     return get_weight_loader(p)
 
 
+def _core_ok(g, x) -> bool:
+    from sglang_neuron.models.hy4 import model as m
+
+    return m._NKI_ATTN_CORE and x.device.type != "cpu" and x.shape[0] <= 8 and not m._ABLATE
+
+
 def accept(tokens, cand, q: int):
     """(accepted drafts [B], the new bonus token [B]) of a verify: ``tokens`` [B Q] the target's token of each row,
     ``cand`` [B Q] the verified ids (the bonus, then the drafts; -1 for no draft). Draft i is accepted while every
@@ -243,8 +249,16 @@ class DFlyStep(nn.Module):
             hist_keep = keep.index_select(0, src)[:, None, :].expand(b, q, cap)
             key_rows = torch.cat([hist, block_rows], dim=-1).reshape(b * q, cap + q)
             key_keep = torch.cat([hist_keep, block_keep], dim=-1).reshape(b * q, cap + q)
-            attended = g._attend_sparse(attn, cache, query, key_rows, key_keep)
-            x = x + attn.output(attended, h)
+            if _core_ok(g, x):
+                # the attention, merge and output projection with their collectives in one kernel
+                # (kernels/attn_core.py); mla_sparse needs 2 x keys a multiple of 512: padded (masked) to 256s
+                kp = -key_rows.shape[1] % 256
+                kr = torch.cat([key_rows, key_rows.new_zeros((key_rows.shape[0], kp))], dim=1)
+                kk = torch.cat([key_keep, key_keep.new_zeros((key_keep.shape[0], kp))], dim=1)
+                x = x + g._attend_core_kernel(attn, cache, query, kr, kk, h)
+            else:
+                attended = g._attend_sparse(attn, cache, query, key_rows, key_keep)
+                x = x + attn.output(attended, h)
             x = x + g.group.all_reduce(layer.mlp(layer.post_attention_layernorm(x)))
         hs = d.final_norm(x).view(b, q, -1)
         prev = bonus
