@@ -75,3 +75,59 @@ def placement_mask(heads: int, device=None):
     j = torch.arange(heads, device=device)[None, :, None]
     c = torch.arange(P, device=device)[None, None, :]
     return (c == (P // heads) * j + p // heads).to(torch.bfloat16)
+
+
+def index_scores_decode(qT, keysT, w, mask):
+    """The decode's scores of a request's rows (a DFly verify's rows share their keys): qT [128, Tp * heads] bf16
+    (column t * heads + h, Tp = 128 / heads * NB); keysT [128, K] bf16; w [Tp * heads / 128, 128] fp32; mask
+    [128, NB, Tp] bf16 (placement_mask_decode) -> scores [Tp, K] fp32. Each 512-key tile: NB matmuls of 128 (token,
+    head) query rows against the keys, the relu on the way out of PSUM, and NB matmuls of the placed weights summing
+    each token's heads into [Tp, 512]; the two programs take alternate key tiles."""
+    D, NQ = qT.shape
+    _, K = keysT.shape
+    _, NB, Tp = mask.shape
+    n_prg = nl.num_programs(axes=0)
+    pid = nl.program_id(axis=0)
+    out = nl.ndarray((Tp, K), dtype=nl.float32, buffer=nl.shared_hbm, name="index_scores_decode_out")
+    q = nl.ndarray((P, NQ), dtype=qT.dtype, buffer=nl.sbuf)
+    nisa.dma_copy(dst=q[0:P, 0:NQ], src=qT.ap(pattern=[[NQ, P], [1, NQ]], offset=0))
+    msk = nl.ndarray((P, NB, Tp), dtype=mask.dtype, buffer=nl.sbuf)
+    nisa.dma_copy(dst=msk[0:P, 0:NB, 0:Tp], src=mask.ap(pattern=[[NB * Tp, P], [Tp, NB], [1, Tp]], offset=0))
+    wt = nl.ndarray((P, NB), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.dma_copy(dst=wt[0:P, 0:NB], src=w.ap(pattern=[[1, P], [P, NB]], offset=0))
+    wb = nl.ndarray((P, NB, Tp), dtype=nl.bfloat16, buffer=nl.sbuf)
+    for j in range(NB):
+        nisa.tensor_scalar(dst=wb[0:P, j, 0:Tp], data=msk[0:P, j, 0:Tp], op0=nl.multiply, operand0=wt[0:P, j:j + 1])
+    NT = K // KEY_TILE
+    NH = -(-NT // n_prg)  # this program's tiles
+    keys = nl.ndarray((P, NH, KEY_TILE), dtype=keysT.dtype, buffer=nl.sbuf)
+    tiles = list(range(pid, NT, n_prg))
+    for i, kt in enumerate(tiles):
+        nisa.dma_copy(dst=keys[0:P, i, 0:KEY_TILE], src=keysT.ap(pattern=[[K, P], [1, KEY_TILE]], offset=kt * KEY_TILE),
+                      dge_mode=nisa.dge_mode.hwdge, engine=(nisa.engine.sync, nisa.engine.scalar)[i % 2])
+    o = nl.ndarray((Tp, NH, KEY_TILE), dtype=nl.float32, buffer=nl.sbuf)
+    for i, kt in enumerate(tiles):
+        acc = nl.ndarray((Tp, KEY_TILE), dtype=nl.float32, buffer=nl.psum)
+        for j in range(NB):
+            s = nl.ndarray((P, KEY_TILE), dtype=nl.float32, buffer=nl.psum)
+            nisa.nc_matmul(dst=s[0:P, 0:KEY_TILE], stationary=q[0:P, j * P:(j + 1) * P], moving=keys[0:P, i, 0:KEY_TILE])
+            r = nl.ndarray((P, KEY_TILE), dtype=nl.bfloat16, buffer=nl.sbuf)
+            nisa.activation(dst=r[0:P, 0:KEY_TILE], op=nl.relu, data=s[0:P, 0:KEY_TILE])
+            nisa.nc_matmul(dst=acc[0:Tp, 0:KEY_TILE], stationary=wb[0:P, j, 0:Tp], moving=r[0:P, 0:KEY_TILE],
+                           accumulate=(j > 0))
+        nisa.tensor_copy(dst=o[0:Tp, i, 0:KEY_TILE], src=acc[0:Tp, 0:KEY_TILE])
+    for i, kt in enumerate(tiles):
+        nisa.dma_copy(dst=out.ap(pattern=[[K, Tp], [1, KEY_TILE]], offset=kt * KEY_TILE), src=o[0:Tp, i, 0:KEY_TILE],
+                      dge_mode=nisa.dge_mode.hwdge, engine=(nisa.engine.sync, nisa.engine.scalar)[i % 2])
+    return out
+
+
+def placement_mask_decode(heads: int, tp: int, device=None):
+    """index_scores_decode's [128, NB, Tp] placement: row p of query block j is token (128 / heads) j + p // heads."""
+    import torch
+
+    nb = tp * heads // P
+    p = torch.arange(P, device=device)[:, None, None]
+    j = torch.arange(nb, device=device)[None, :, None]
+    c = torch.arange(tp, device=device)[None, None, :]
+    return (c == (P // heads) * j + p // heads).to(torch.bfloat16)

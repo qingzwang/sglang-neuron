@@ -352,6 +352,9 @@ _HC_CHAIN = os.environ.get("HY4_HC_CHAIN", "0") == "1"  # the decode's layer-bou
 _NKI_ATTN_IN = _NKI and os.environ.get("HY4_NKI_ATTN_IN", "0") == "1"  # the decode attention input kernel
 # its q_a / kv_a sharded over the attention TP (kernels/attn_in.py qkv_sh; the prefill keeps the replicated ones)
 _QKV_SH = _NKI_ATTN_IN and os.environ.get("HY4_QKV_SH", "0") == "1"
+# the decode indexer's scores in one NKI kernel a request (kernels/index_scores.py index_scores_decode): a DFly
+# verify's rows share their keys, gathered once
+_NKI_INDEX_DECODE = _NKI and os.environ.get("HY4_NKI_INDEX_DECODE", "0") == "1"
 _NKI_ATTN_CORE = _NKI and os.environ.get("HY4_NKI_ATTN_CORE", "0") == "1"  # the decode attention core kernel
 _NKI_LAYER = _NKI and os.environ.get("HY4_NKI_LAYER", "0") == "1"  # a shared decode layer in one kernel
 _NKI_MOE_SUB = _NKI and os.environ.get("HY4_NKI_MOE_SUB", "0") == "1"  # the decode MoE sublayer kernel
@@ -897,7 +900,8 @@ class Hy4Graph(nn.Module):
         elif attn.full:
             iq, iw, ik = attn.index_project(x, q_lat, cos, sin)
             _write(index_cache, write_rows, ik)
-            selected, scores = self._select(index_cache, iq, iw, key_rows, valid)
+            # (not in the prologue's layer 0: its program got slower with it, 6.3 -> ~10 ms at 512K)
+            selected, scores = self._select(index_cache, iq, iw, key_rows, valid, kernel_ok=attn.layer_idx > 0)
             # the dense prefill's mask crosses program boundaries (runtime.py) as uint8: a boolean program output of
             # this shape hits a neuronx-cc internal error (NCC_ILSA902)
             # the dense prefill carries the selection as an additive score bias (arithmetic only: selects over the
@@ -996,10 +1000,28 @@ class Hy4Graph(nn.Module):
             return False
         return self.phase == "decode" or key_rows.shape[-1] > PREFILL_DENSE_KEYS
 
-    def _select(self, cache, iq, iw, key_rows, valid):
+    def _select(self, cache, iq, iw, key_rows, valid, kernel_ok: bool = True):
         """The selection mask [T, keys] of a full layer over this rank's keys, and their scores."""
         cfg = self.config
-        if self.phase == "decode":
+        q = self.dfly.dfly.block if self.dfly is not None else 0
+        if (kernel_ok and self.phase == "decode" and _NKI_INDEX_DECODE and q and iq.shape[0] % q == 0 and iq.device.type != "cpu"
+                and key_rows.shape[-1] % 512 == 0 and (q * iq.shape[1]) <= 256):
+            from sglang_neuron.backend.stack import wrap_nki
+            from sglang_neuron.models.hy4.kernels.index_scores import index_scores_decode, placement_mask_decode
+            from sglang_neuron.utils.hardware_config import get_logical_nc_config
+
+            t, ih, idim = iq.shape
+            tp = 256 // ih  # the rows padded to two 128-row query blocks
+            mask = placement_mask_decode(ih, tp, iq.device)
+            parts = []
+            for b in range(t // q):  # each request's rows (dfly_worker repeats its table over them)
+                qb = torch.cat([iq[b * q:(b + 1) * q], iq.new_zeros(tp - q, ih, idim)]).reshape(tp * ih, idim)
+                wb = torch.cat([iw[b * q:(b + 1) * q], iw.new_zeros(tp - q, ih)]).to(torch.float32).reshape(-1, 128)
+                keys = cache[key_rows[b * q]]  # [K, idim]
+                parts.append(wrap_nki(index_scores_decode)[get_logical_nc_config()](
+                    qb.t().contiguous(), keys.t().contiguous(), wb, mask)[:q])
+            scores = torch.cat(parts) if len(parts) > 1 else parts[0]
+        elif self.phase == "decode":
             keys = cache[key_rows].float()  # [B, keys, idim]
             s = torch.einsum("bhd,bkd->bhk", iq.float(), keys).relu()
             # the head weighting as a multiply and a sum over the heads: as an einsum it lowers to a batched matmul of
