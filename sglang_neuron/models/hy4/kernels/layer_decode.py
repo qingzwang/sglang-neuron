@@ -54,6 +54,9 @@ def layer_decode(streams, p_out, p_post, fn_a, aff_a, fn_m, aff_m, ones, place,
                                                           ranks=ranks, eps=eps, lat_eps=eps, tag=tag)
     nisa.core_barrier(query, (0, 1))
     nisa.core_barrier(gate_x, (0, 1))
+    # the rows attn_in wrote (both programs, in place) before attn_core gathers keys from them: an indirect gather
+    # is not ordered after the writes otherwise (the sparse attention then misses the newest rows)
+    nisa.core_barrier(cache, (0, 1))
     TQ = query.shape[0]
     D = query.shape[2]
     att = attn_core_decode(query.reshape((TQ * query.shape[1] // 128, 128, D)), cache, slots, bias, onehot, sinks,
