@@ -53,9 +53,10 @@ SELECT_BINS = 16
 SELECT_ROUNDS = 4
 # up to this many rows the attention merge gathers every rank's (max, sum) in one all-gather (Attention.merge)
 MERGE_GATHER_ROWS = 64
-# the decode's (one all-reduce a round; its counting is over a few rows): 256 ** 2 = 16 ** 4
-DECODE_SELECT_BINS = 256
-DECODE_SELECT_ROUNDS = 2
+# the decode's (one all-reduce a round; its counting is over a few rows): 16 ** 4 = 256 ** 2, the counting's cost
+# growing with the bins (DFly verify, full model: 16 x 4 54.5 ms of groups, 64 x 3 54.8, 256 x 2 57.3; the same
+# accepts). HY4_DECODE_SELECT "bins,rounds" overrides
+DECODE_SELECT_BINS, DECODE_SELECT_ROUNDS = (int(v) for v in os.environ.get("HY4_DECODE_SELECT", "16,4").split(","))
 # the key tile of the prefill's attention and indexer: one tile's scores are [chunk, heads, KEY_TILE] fp32
 KEY_TILE = 1024
 # Sparse attention over a compacted selection: each rank attends each query over at most SPARSE_CAP of its own
