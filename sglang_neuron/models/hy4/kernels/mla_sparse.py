@@ -24,7 +24,7 @@ KEY_TILE = 512
 NBUF = 3  # gather buffers in flight
 
 
-def mla_sparse(q, cache, rows, bias, onehot, scale=1.0):
+def mla_sparse(q, cache, rows, bias, onehot, scale=1.0, tag=""):
     """q [NB, 128, D] bf16; cache [R, D] bf16 (this layer's cache rows); rows [NB, S] int32 (the block's slots' cache
     rows, R for a pad slot); bias [NB, 128 / H, S] bf16; onehot [128 / H, 128] bf16 -> (out [H, T, L] fp32, ml [H, T, 2]
     fp32), with S a multiple of 512, at most 2048, and L = 512."""
@@ -40,8 +40,8 @@ def mla_sparse(q, cache, rows, bias, onehot, scale=1.0):
     NC = len(chunks)
     n_prg = nl.num_programs(axes=0)
     pid = nl.program_id(axis=0)
-    out = nl.ndarray((H, T, L), dtype=nl.float32, buffer=nl.shared_hbm, name="mla_sparse_out")
-    ml = nl.ndarray((H, T, 2), dtype=nl.float32, buffer=nl.shared_hbm, name="mla_sparse_ml")
+    out = nl.ndarray((H, T, L), dtype=nl.float32, buffer=nl.shared_hbm, name="mla_sparse_out" + tag)
+    ml = nl.ndarray((H, T, 2), dtype=nl.float32, buffer=nl.shared_hbm, name="mla_sparse_ml" + tag)
 
     oh = nl.ndarray((TPB, P), dtype=onehot.dtype, buffer=nl.sbuf)
     nisa.dma_copy(dst=oh[0:TPB, 0:P], src=onehot.ap(pattern=[[P, TPB], [1, P]], offset=0))

@@ -211,17 +211,43 @@ class Attention(nn.Module):
         latent [T, q_lora])."""
         cfg = self.config
         t = x.shape[0]
-        q_lat = self.q_a_layernorm(x @ self.q_a)
+        if _NKI_PROJ and x.device.type != "cpu" and t <= 32:  # only a decode has so few rows
+            # the decode's replicated down-projections in one NKI kernel at the weights' DMA rate (kernels/gemv_wide.py)
+            from sglang_neuron.backend.stack import wrap_nki
+            from sglang_neuron.models.hy4.kernels.gemv_wide import gemv_wide
+            from sglang_neuron.utils.hardware_config import get_logical_nc_config
+
+            qa, kva = wrap_nki(gemv_wide)[get_logical_nc_config()](x.t().contiguous(), self.q_a, self.kv_a)
+            q_lat = self.q_a_layernorm(qa.to(DTYPE))
+            lat_pe = kva.to(DTYPE)
+        else:
+            q_lat = self.q_a_layernorm(x @ self.q_a)
+            lat_pe = x @ self.kv_a
         q = (q_lat @ self.q_b).view(t, self.heads, cfg.q_head_dim)
         q_nope, q_pe = q.split([cfg.qk_nope_head_dim, cfg.qk_rope_head_dim], dim=-1)
         q_pe = rotate(q_pe, cos, sin)
         q_abs = torch.einsum("thd,hdr->thr", q_nope, self.w_uk)
         query = torch.cat([q_abs, q_pe], dim=-1)
-        latent, k_pe = (x @ self.kv_a).split([cfg.kv_lora_rank, cfg.qk_rope_head_dim], dim=-1)
+        latent, k_pe = lat_pe.split([cfg.kv_lora_rank, cfg.qk_rope_head_dim], dim=-1)
         compact = torch.cat([self.kv_a_layernorm(latent), rotate(k_pe, cos, sin)], dim=-1)
         # every head's query on every rank: the attention runs over this rank's share of the keys for all heads
         query = self.group.all_gather(query, dim=1)
         return query, compact, q_lat
+
+    def project_fused(self, x_raw, ln_w, cos, sin, cache, write_rows):
+        """project(input_layernorm(x_raw)) for a decode of <= 8 rows in one NKI kernel (kernels/attn_in.py), the
+        query's all-gather and the cache write (rows ``write_rows``) included."""
+        from sglang_neuron.backend.stack import wrap_nki
+        from sglang_neuron.models.hy4.kernels.attn_in import attn_in_decode
+        from sglang_neuron.utils.hardware_config import get_logical_nc_config
+
+        cfg = self.config
+        q, compact, q_lat, _ = wrap_nki(attn_in_decode, alias_outputs_in_place=True)[get_logical_nc_config()](
+            x_raw.to(DTYPE).contiguous(), ln_w.reshape(1, -1), self.q_a, self.q_a_layernorm.weight.reshape(1, -1),
+            self.q_b, self.w_uk, self.kv_a, self.kv_a_layernorm.weight.reshape(1, -1), cos.contiguous(),
+            sin.contiguous(), cache, write_rows.to(torch.int32).reshape(1, -1),
+            ranks=(tuple(range(self.group.size)),), eps=float(cfg.rms_norm_eps), lat_eps=float(self.q_a_layernorm.eps))
+        return q, compact, q_lat
 
     def index_project(self, x, q_lat, cos, sin):
         """The indexer's queries [T, ih, idim] and head weights [T, ih] (fp32), and the tokens' index keys [T, idim]."""
@@ -315,6 +341,12 @@ _NKI_MOE = _NKI and os.environ.get("HY4_NKI_MOE", "1") != "0"
 _MOE_DECODE_V2 = os.environ.get("HY4_MOE_DECODE_V2", "1") != "0"
 _NKI_COMPACT = _NKI and os.environ.get("HY4_NKI_COMPACT", "1") != "0"
 _NKI_HC_DECODE = _NKI and os.environ.get("HY4_NKI_HC_DECODE", "1") != "0"
+_HC_CHAIN = os.environ.get("HY4_HC_CHAIN", "0") == "1"  # the decode's layer-boundary HC post + pre in one kernel
+_NKI_ATTN_IN = _NKI and os.environ.get("HY4_NKI_ATTN_IN", "0") == "1"  # the decode attention input kernel
+_NKI_ATTN_CORE = _NKI and os.environ.get("HY4_NKI_ATTN_CORE", "0") == "1"  # the decode attention core kernel
+_NKI_LAYER = _NKI and os.environ.get("HY4_NKI_LAYER", "0") == "1"  # a shared decode layer in one kernel
+_NKI_MOE_SUB = _NKI and os.environ.get("HY4_NKI_MOE_SUB", "0") == "1"  # the decode MoE sublayer kernel
+_NKI_PROJ = _NKI and os.environ.get("HY4_NKI_PROJ", "0") == "1"  # decode q_a / kv_a through kernels/gemv_wide.py
 _NKI_MOE_BLOCK = _NKI and os.environ.get("HY4_NKI_MOE_BLOCK", "0") == "1"  # off: slower in the served graph so far
 
 
@@ -410,6 +442,16 @@ class MoE(nn.Module):
         self.down = nn.Parameter(torch.empty(e, inner, hidden, dtype=torch.float8_e4m3fn))
         self.down_scale = nn.Parameter(torch.empty(e, inner // b, hidden // b, dtype=torch.float32))
         self.shared = MLP(config, inner * config.n_shared_experts, tp) if config.n_shared_experts else None
+        self.tp = tp
+        # the decode MoE sublayer kernel's (kernels/moe_sublayer.py) copies of the router and the shared gate / up,
+        # partition-major (whole DMA packets)
+        self.router_pm = nn.Parameter(torch.empty(weights.BLOCK, hidden * config.n_routed_experts // weights.BLOCK,
+                                                  dtype=DTYPE))
+        set_weight_loader(self.router_pm, weights.router_pm_loader())
+        if self.shared is not None:
+            rows = inner * config.n_shared_experts // tp
+            self.sh_gate_up_pm = nn.Parameter(torch.empty(2, weights.BLOCK, hidden * rows // weights.BLOCK, dtype=DTYPE))
+            set_weight_loader(self.sh_gate_up_pm, weights.shared_pm_loader(rows))
         set_weight_loader(self.router, weights.transposed())
         set_weight_loader(self.router_bias, weights.as_float())
         set_weight_loader(self.gate_up, weights.experts_gate_up_loader())
@@ -471,6 +513,21 @@ class MoE(nn.Module):
             h = (F.silu(gate) * up).to(DTYPE)
             out = out + (h @ _dequant(self.down[e], self.down_scale[e])).float() * aff[:, e:e + 1]
         return out.to(DTYPE)
+
+    def sublayer(self, x, ln_w, rank):
+        """The decode MoE sublayer in one NKI kernel (kernels/moe_sublayer.py): RMSNorm, routing, shared and routed
+        experts and the all-reduce; the all-reduced output [T, H] bf16."""
+        from sglang_neuron.backend.stack import wrap_nki
+        from sglang_neuron.models.hy4.kernels.moe_sublayer import moe_sublayer_decode
+        from sglang_neuron.utils.hardware_config import get_logical_nc_config
+
+        cfg = self.config
+        base = (rank.to(torch.int32).reshape(1, 1) * self.num_local).contiguous()
+        return wrap_nki(moe_sublayer_decode)[get_logical_nc_config()](
+            x.to(DTYPE).contiguous(), ln_w.reshape(1, -1), self.router_pm, self.router_bias.reshape(1, -1), base,
+            self.gate_up, self.gate_up_scale, self.down, self.down_scale, self.sh_gate_up_pm, self.shared.down,
+            ranks=(tuple(range(self.tp)),), top_k=cfg.num_experts_per_tok, scaling=float(cfg.routed_scaling_factor),
+            limit=float(cfg.swiglu_limit or 3.0e38), eps=float(cfg.rms_norm_eps))
 
     def _block_kernel(self, x, rank):
         """The whole decode block (router, choice, routed experts, shared expert) in one NKI kernel
@@ -581,6 +638,13 @@ class HyperConnection(nn.Module):
             torch.stack([scale, self.base]).contiguous(), rms_eps=cfg.rms_norm_eps, hc_eps=cfg.hc_eps,
             magnitude=cfg.hc_magnitude)
         return x, post
+
+    def affine(self):
+        """[2, R] fp32: each mixing row's scale and base, as the decode HC kernels take them."""
+        n, rows = self.config.hc_mult, self.fn.shape[0]
+        scale = torch.cat([self.scale[0].expand(n), self.scale[-1].expand(rows - n)]) if rows == 2 * n else \
+            self.scale[0].expand(rows)
+        return torch.stack([scale, self.base]).contiguous()
 
     def post_pre_decode(self, streams, out, post):
         """post(streams, out, post), then this mixer's pre, in one decode kernel: (streams', x, post')."""
@@ -732,19 +796,39 @@ class Hy4Graph(nn.Module):
         real = (md["slot_mapping"].to(torch.int64) > 0).to(torch.float32)
         return streams, (cos, sin, write_rows, key_rows, valid.to(torch.uint8), real)
 
-    def run_layer(self, layer, cache, index_cache, streams, step, state, rank, replicated: bool = False):
+    def run_layer(self, layer, cache, index_cache, streams, step, state, rank, replicated: bool = False,
+                  pending=None, defer: bool = False):
         """One decoder layer over ``streams``; ``state`` is the selection of the last full layer (a shared layer's),
-        returned updated by a full layer: (compacted rows, keep) with SPARSE_CAP, else (mask,)."""
+        returned updated by a full layer: (compacted rows, keep) with SPARSE_CAP, else (mask,).
+
+        ``pending`` (out, post): the last layer's MLP output whose hyper-connection post update is still to apply,
+        fused here with this layer's pre (hc_decode); ``defer``: return this layer's MLP output that way, as
+        (streams, state, (out, post)), instead of applying it (the decode, between the layers of a group)."""
         cos, sin, write_rows, key_rows, valid, real = step
         valid = valid != 0
         attn = layer.self_attn
-        if "hc" in _ABLATE:
+        if (_NKI_LAYER and self.phase == "decode" and not attn.full and not layer.dense and state is not None
+                and len(state) == 2 and streams.shape[0] <= 8 and streams.device.type != "cpu" and not _ABLATE):
+            # the whole layer in one kernel (kernels/layer_decode.py)
+            streams, out, post = self._layer_kernel(layer, cache, streams, step, state, rank, pending)
+            if defer:
+                return streams, state, (out, post)
+            return HyperConnection.post(streams, out, post), state
+        if pending is not None:
+            streams, x, post = layer.attn_hc.post_pre_decode(streams, pending[0], pending[1])
+        elif "hc" in _ABLATE:
             x, post = streams[:, 0], None
         else:
             x, post = layer.attn_hc.pre(streams, replicated)
-        x = layer.input_layernorm(x)
-        query, compact, q_lat = attn.project(x, cos, sin)
-        _write(cache, write_rows, compact)
+        if _NKI_ATTN_IN and self.phase == "decode" and x.shape[0] <= 8 and x.device.type != "cpu" and not _ABLATE:
+            # the norm, the projections, RoPE and the query's all-gather in one kernel (kernels/attn_in.py); the
+            # graph's own normed input feeds the indexer and the output gate only
+            query, compact, q_lat = attn.project_fused(x, layer.input_layernorm.weight, cos, sin, cache, write_rows)
+            x = layer.input_layernorm(x)
+        else:
+            x = layer.input_layernorm(x)
+            query, compact, q_lat = attn.project(x, cos, sin)
+            _write(cache, write_rows, compact)
         if attn.full and "index" in _ABLATE:
             if state is None:
                 rows = key_rows[:, :self.sparse_cap] if self.phase == "decode" else key_rows[0][:self.sparse_cap][None].expand(x.shape[0], -1)
@@ -759,13 +843,18 @@ class Hy4Graph(nn.Module):
             # mask, in and across programs, hit a neuronx-cc internal error, NCC_ILSA902)
             state = self._compact(selected, scores, key_rows) if self._sparse(key_rows) else (
                 (selected.to(torch.float32) - 1.0) * -MASKED,)
-        if "attn" in _ABLATE:
-            attended = query[:, :attn.heads, :self.config.kv_lora_rank].float()
-        elif self._sparse(key_rows):
-            attended = self._attend_sparse(attn, cache, query, *state)
+        if (_NKI_ATTN_CORE and self.phase == "decode" and self._sparse(key_rows) and x.shape[0] <= 8
+                and x.device.type != "cpu" and not _ABLATE and attn.heads == 1):
+            # the attention, its merge and the output projection with their three collectives in one kernel
+            out = self._attend_core_kernel(attn, cache, query, *state, x)
         else:
-            attended = self._attend(attn, cache, query, key_rows, state[0])
-        out = attn.output(attended, x)
+            if "attn" in _ABLATE:
+                attended = query[:, :attn.heads, :self.config.kv_lora_rank].float()
+            elif self._sparse(key_rows):
+                attended = self._attend_sparse(attn, cache, query, *state)
+            else:
+                attended = self._attend(attn, cache, query, key_rows, state[0])
+            out = attn.output(attended, x)
         if "hc" in _ABLATE:
             streams = streams + out[:, None, :]
             x = streams[:, 0]
@@ -775,14 +864,65 @@ class Hy4Graph(nn.Module):
         else:
             streams = HyperConnection.post(streams, out, post)
             x, post = layer.mlp_hc.pre(streams)
-        x = layer.post_attention_layernorm(x)
-        if "moe" in _ABLATE and not layer.dense:
-            out = layer.mlp.shared(x)
+        if (_NKI_MOE_SUB and self.phase == "decode" and not layer.dense and x.shape[0] <= 8
+                and x.device.type != "cpu" and not _ABLATE and layer.mlp.shared is not None):
+            # norm, MoE and its all-reduce in one kernel (kernels/moe_sublayer.py)
+            out = layer.mlp.sublayer(x, layer.post_attention_layernorm.weight, rank)
         else:
-            out = layer.mlp(x) if layer.dense else layer.mlp(x, rank, real)
-        out = self.group.all_reduce(out)
+            x = layer.post_attention_layernorm(x)
+            if "moe" in _ABLATE and not layer.dense:
+                out = layer.mlp.shared(x)
+            else:
+                out = layer.mlp(x) if layer.dense else layer.mlp(x, rank, real)
+            out = self.group.all_reduce(out)
+        if defer:
+            return streams, state, (out, post)
         streams = streams + out[:, None, :] if "hc" in _ABLATE else HyperConnection.post(streams, out, post)
         return streams, state
+
+    def _layer_kernel(self, layer, cache, streams, step, state, rank, pending):
+        """A shared decode layer in one NKI kernel: (streams before the MLP's post update, the MLP output, its post)."""
+        from sglang_neuron.backend.stack import wrap_nki
+        from sglang_neuron.models.hy4.kernels.hc_decode import decode_constants
+        from sglang_neuron.models.hy4.kernels.layer_decode import layer_decode
+        from sglang_neuron.models.hy4.kernels.mla_dense import onehot_rows
+        from sglang_neuron.models.hy4.kernels.mla_sparse import block_slots
+        from sglang_neuron.utils.hardware_config import get_logical_nc_config
+
+        cfg = self.config
+        cos, sin, write_rows, key_rows, valid, real = step
+        rows, keep = state
+        attn, moe = layer.self_attn, layer.mlp
+        t = streams.shape[0]
+        n = cfg.hc_mult
+        if pending is None:
+            pending = (streams.new_zeros((t, cfg.hidden_size)), torch.zeros(t, n, dtype=torch.float32,
+                                                                              device=streams.device))
+        pad = -t % 4
+        if pad:
+            rows = torch.cat([rows, rows.new_zeros((pad, rows.shape[1]))])
+            keep = torch.cat([keep, keep.new_zeros((pad, keep.shape[1]))])
+        slots, bias = block_slots(rows, keep, cfg.num_attention_heads, cache.shape[0])
+        ones, place = decode_constants(n, streams.device)
+        new, out, post, _ = wrap_nki(layer_decode, alias_outputs_in_place=True)[get_logical_nc_config()](
+            streams.reshape(t, -1), pending[0].to(DTYPE), pending[1], layer.attn_hc.fn, layer.attn_hc.affine(), layer.mlp_hc.fn,
+            layer.mlp_hc.affine(), ones, place,
+            layer.input_layernorm.weight.reshape(1, -1), attn.q_a, attn.q_a_layernorm.weight.reshape(1, -1), attn.q_b,
+            attn.w_uk, attn.kv_a, attn.kv_a_layernorm.weight.reshape(1, -1), attn.gate, cos.contiguous(),
+            sin.contiguous(), cache, write_rows.to(torch.int32).reshape(1, -1), slots, bias,
+            onehot_rows(cfg.num_attention_heads, streams.device), attn.sinks.reshape(1, -1), attn.w_uv[0], attn.o,
+            layer.post_attention_layernorm.weight.reshape(1, -1), moe.router_pm, moe.router_bias.reshape(1, -1),
+            (rank.to(torch.int32).reshape(1, 1) * moe.num_local).contiguous(), moe.gate_up, moe.gate_up_scale, moe.down,
+            moe.down_scale, moe.sh_gate_up_pm, moe.shared.down,
+            ranks=(tuple(range(self.group.size)),), eps=float(cfg.rms_norm_eps), hc_eps=float(cfg.hc_eps),
+            magnitude=float(cfg.hc_magnitude), scale=float(cfg.softmax_scale), top_k=cfg.num_experts_per_tok,
+            scaling=float(cfg.routed_scaling_factor), limit=float(cfg.swiglu_limit or 3.0e38), t_pad=t + pad,
+            tag=f"_l{attn.layer_idx}")
+        return new.reshape(streams.shape), out, post
+
+    def defers_hc(self, streams) -> bool:
+        """Whether a group's layers hand their MLP's post update to the next layer's pre (one hc_decode kernel)."""
+        return _HC_CHAIN and self.phase == "decode" and _NKI_HC_DECODE and streams.device.type != "cpu" and not _ABLATE
 
     def epilogue(self, streams, sampling_positions):
         """The sampled rows' logits [rows, vocab / tp] (fp32: enable_lm_head_fp32)."""
@@ -850,6 +990,28 @@ class Hy4Graph(nn.Module):
         else:
             rows = key_rows[0][idx]
         return rows, keep
+
+    def _attend_core_kernel(self, attn, cache, query, rows, keep, x):
+        """The decode attention core in one NKI kernel (kernels/attn_core.py): the rows padded to whole kernel row
+        blocks; the all-reduced attention output [T, H]."""
+        from sglang_neuron.backend.stack import wrap_nki
+        from sglang_neuron.models.hy4.kernels.attn_core import attn_core_decode
+        from sglang_neuron.models.hy4.kernels.mla_dense import onehot_rows
+        from sglang_neuron.models.hy4.kernels.mla_sparse import block_slots
+        from sglang_neuron.utils.hardware_config import get_logical_nc_config
+
+        t, h, d = query.shape
+        pad = -t % 4
+        if pad:
+            query = torch.cat([query, query.new_zeros((pad, h, d))])
+            rows = torch.cat([rows, rows.new_zeros((pad, rows.shape[1]))])
+            keep = torch.cat([keep, keep.new_zeros((pad, keep.shape[1]))])
+        slots, bias = block_slots(rows, keep, h, cache.shape[0])
+        gate_x = torch.sigmoid(x @ attn.gate)
+        return wrap_nki(attn_core_decode)[get_logical_nc_config()](
+            query.to(DTYPE).reshape(-1, 128, d), cache, slots, bias, onehot_rows(h, query.device),
+            attn.sinks.reshape(1, -1), attn.w_uv[0], gate_x, attn.o, ranks=(tuple(range(self.group.size)),),
+            scale=float(self.config.softmax_scale), t_real=t)
 
     def _attend_sparse(self, attn, cache, query, rows, keep):
         """Each head of each query over the rank's compacted selected keys (rows [R, cap]), merged across the ranks."""
@@ -995,6 +1157,7 @@ class Hy4Graph(nn.Module):
             local = range(rank * moe.num_local, (rank + 1) * moe.num_local)
             mappings.update({
                 f"{dst}.mlp.router": f"{m}.gate.weight",
+                f"{dst}.mlp.router_pm": f"{m}.gate.weight",
                 f"{dst}.mlp.router_bias": f"{m}.gate.e_score_correction_bias",
                 f"{dst}.mlp.gate_up": [f"{m}.experts.{e}.{p}_proj.weight" for e in local for p in ("gate", "up")],
                 f"{dst}.mlp.gate_up_scale": [f"{m}.experts.{e}.{p}_proj.weight_scale" for e in local
@@ -1004,6 +1167,8 @@ class Hy4Graph(nn.Module):
             })
             if moe.shared is not None:
                 mappings.update(_mlp_mappings(f"{m}.shared_experts", f"{dst}.mlp.shared"))
+                mappings[f"{dst}.mlp.sh_gate_up_pm"] = [f"{m}.shared_experts.gate_proj.weight",
+                                                       f"{m}.shared_experts.up_proj.weight"]
         if self.dfly is not None:
             mappings.update(self.dfly.weight_mappings())
         return mappings

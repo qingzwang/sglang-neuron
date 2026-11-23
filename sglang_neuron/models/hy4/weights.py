@@ -206,3 +206,21 @@ def fp8(loader: SafetensorsWeightLoader) -> SafetensorsWeightLoader:
 def column_shard(rows: int) -> SafetensorsWeightLoader:
     """A [out, in] projection whose output rows shard over the ranks: this rank's [in, out / tp]."""
     return SafetensorsWeightLoader(transform=lambda slices, rank: slices[0][rank * rows:(rank + 1) * rows].t())
+
+
+def router_pm_loader() -> SafetensorsWeightLoader:
+    """The router (gate.weight [NE, H]) as kernels/moe_sublayer.py's partition-major [128, H / 128 * NE] bf16."""
+    from sglang_neuron.models.hy4.kernels.moe_sublayer import router_partition_major
+
+    return SafetensorsWeightLoader(transform=lambda slices, rank: router_partition_major(
+        slices[0][:].t().contiguous().to(torch.bfloat16)))
+
+
+def shared_pm_loader(rows: int) -> SafetensorsWeightLoader:
+    """This rank's shared gate / up ([H, 2 rows] as mlp_gate_up_loader builds it) as kernels/moe_sublayer.py's
+    partition-major [2, 128, H / 128 * rows]."""
+    from sglang_neuron.models.hy4.kernels.moe_sublayer import shared_partition_major
+
+    inner = mlp_gate_up_loader(rows)
+    return SafetensorsWeightLoader(transform=lambda slices, rank: shared_partition_major(
+        inner.transform(slices, rank).contiguous(), 2))

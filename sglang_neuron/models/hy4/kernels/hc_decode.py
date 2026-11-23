@@ -24,7 +24,7 @@ import nki.language as nl
 P = 128
 
 
-def hc_decode(streams, out, post, fn, affine, ones, place, rms_eps=1e-6, hc_eps=1e-6, magnitude=1.0):
+def hc_decode(streams, out, post, fn, affine, ones, place, rms_eps=1e-6, hc_eps=1e-6, magnitude=1.0, tag=""):
     """streams [T, n * H] bf16; out [T, H] bf16 (the sublayer's output); post [T, n] fp32 (its post weights); fn
     [R, n * H] fp32 (the next mixer's rows); affine [2, R] fp32 (scale, base); ones [128, 1] fp32; place [128, n, 32]
     fp32 (place[p, i, r] = 1 where p = 32 i + r) -> (streams' [T, n * H] bf16, x [T, H] bf16, post' [T, n] fp32: zeros
@@ -35,9 +35,9 @@ def hc_decode(streams, out, post, fn, affine, ones, place, rms_eps=1e-6, hc_eps=
     R = fn.shape[0]
     F = W // P  # elements a partition holds of a token's streams
     G = P // n  # partitions of a stream
-    new = nl.ndarray((T, W), dtype=nl.bfloat16, buffer=nl.shared_hbm, name="hc_decode_streams")
-    x_out = nl.ndarray((T, H), dtype=nl.bfloat16, buffer=nl.shared_hbm, name="hc_decode_x")
-    post_out = nl.ndarray((T, n), dtype=nl.float32, buffer=nl.shared_hbm, name="hc_decode_post")
+    new = nl.ndarray((T, W), dtype=nl.bfloat16, buffer=nl.shared_hbm, name="hc_decode_streams" + tag)
+    x_out = nl.ndarray((T, H), dtype=nl.bfloat16, buffer=nl.shared_hbm, name="hc_decode_x" + tag)
+    post_out = nl.ndarray((T, n), dtype=nl.float32, buffer=nl.shared_hbm, name="hc_decode_post" + tag)
 
     # fn laid out as the streams: fnl[p, j, f] = fn[j, p * F + f]
     fnl = nl.ndarray((P, R, F), dtype=nl.float32, buffer=nl.sbuf)
@@ -136,7 +136,7 @@ def decode_constants(n: int, device=None):
     return torch.ones(P, 1, device=device), place
 
 
-def hc_decode_batched(streams, out, post, fn, affine, ones, place, rms_eps=1e-6, hc_eps=1e-6, magnitude=1.0):
+def hc_decode_batched(streams, out, post, fn, affine, ones, place, rms_eps=1e-6, hc_eps=1e-6, magnitude=1.0, tag=""):
     """hc_decode with each program's tokens (a contiguous half of the T rows) side by side in the free dimension:
     one DMA a tensor and one instruction an op for all of them, where hc_decode repeats each per token (a DFly verify
     has Q rows a request). Same inputs and outputs."""
@@ -146,9 +146,9 @@ def hc_decode_batched(streams, out, post, fn, affine, ones, place, rms_eps=1e-6,
     R = fn.shape[0]
     F = W // P
     G = P // n
-    new = nl.ndarray((T, W), dtype=nl.bfloat16, buffer=nl.shared_hbm, name="hc_decode_streams")
-    x_out = nl.ndarray((T, H), dtype=nl.bfloat16, buffer=nl.shared_hbm, name="hc_decode_x")
-    post_out = nl.ndarray((T, n), dtype=nl.float32, buffer=nl.shared_hbm, name="hc_decode_post")
+    new = nl.ndarray((T, W), dtype=nl.bfloat16, buffer=nl.shared_hbm, name="hc_decode_streams" + tag)
+    x_out = nl.ndarray((T, H), dtype=nl.bfloat16, buffer=nl.shared_hbm, name="hc_decode_x" + tag)
+    post_out = nl.ndarray((T, n), dtype=nl.float32, buffer=nl.shared_hbm, name="hc_decode_post" + tag)
 
     fnl = nl.ndarray((P, R, F), dtype=nl.float32, buffer=nl.sbuf)
     nisa.dma_copy(dst=fnl[0:P, 0:R, 0:F], src=fn.ap(pattern=[[F, P], [W, R], [1, F]], offset=0))

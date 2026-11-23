@@ -17,6 +17,7 @@ compiled once per bucket, and the platform's program-switch fence meets the rank
 from __future__ import annotations
 
 import logging
+import os
 
 import torch
 from torch import nn
@@ -93,9 +94,17 @@ class _Group(nn.Module):
 
     def forward(self, caches, index_cache, streams, step, state, rank):
         g = self.graph
+        chain = g.defers_hc(streams)
+        pending = None
+        last = len(self.layers) - 1
         for j, layer in enumerate(self.layers):
-            streams, state = g.run_layer(layer, caches[j], index_cache if layer.self_attn.full else None,
-                                         streams, step, state, rank)
+            r = g.run_layer(layer, caches[j], index_cache if layer.self_attn.full else None, streams, step, state, rank,
+                            pending=pending, defer=chain and j < last)
+            if chain and j < last:
+                streams, state, pending = r
+            else:
+                streams, state = r
+                pending = None
         return streams, state
 
 
@@ -259,6 +268,53 @@ class StagedStep:
         return out
 
     def _call(self, blocks: int = 0, **kwargs):
+        if _LAUNCH and self.graph.phase == "decode":
+            return self._launch_timed(blocks, **kwargs)
+        return self._call_inner(blocks, **kwargs)
+
+    def _dump_group(self, args):
+        """HY4_DUMP_GROUP=<dir>: rank 0 saves the inputs of one decode group call (the HY4_DUMP_AT-th step's 10th
+        group), flattened in argument order, for profiling the group program with real inputs (prof_nx)."""
+        import numpy as np
+
+        n = self.__dict__.setdefault("_dump_steps", 0) + 1
+        self._dump_steps = n
+        if n != int(os.environ.get("HY4_DUMP_AT", "200")) or int(self.graph.group.coordinator.rank_in_group) != 0:
+            return
+        leaves, _ = torch.utils._pytree.tree_flatten(args)
+        d = os.environ["HY4_DUMP_GROUP"]
+        os.makedirs(d, exist_ok=True)
+        views = {torch.bfloat16: torch.int16, torch.float8_e4m3fn: torch.int8}
+        with open(os.path.join(d, "index.txt"), "w") as f:
+            for i, t in enumerate(x for x in leaves if isinstance(x, torch.Tensor)):
+                t = t.detach().to("cpu").contiguous()
+                name = {torch.bfloat16: "bfloat16", torch.float8_e4m3fn: "float8_e4m3fn", torch.bool: "uint8"}.get(
+                    t.dtype, str(t.dtype).replace("torch.", ""))
+                a = t.view(views[t.dtype]) if t.dtype in views else t.to(torch.uint8) if t.dtype == torch.bool else t
+                np.save(os.path.join(d, f"in{i}.npy"), a.numpy())
+                f.write(f"in{i}.npy {name} {list(t.shape)}\n")
+        logger.info("Hy4: dumped a decode group call's inputs to %s", d)
+
+    def _launch_timed(self, blocks, **kwargs):
+        """HY4_DEBUG_LAUNCH=1: the host time of a decode step's calls (no device sync), against the step period."""
+        import time
+
+        t0 = time.perf_counter()
+        out = self._call_inner(blocks, **kwargs)
+        t1 = time.perf_counter()
+        st = self.__dict__.setdefault("_launch_stats", [0, 0.0, None, 0.0])
+        if st[2] is not None:
+            st[3] += t0 - st[2]
+        st[0] += 1
+        st[1] += t1 - t0
+        st[2] = t0
+        if st[0] % 100 == 0 and int(self.graph.group.coordinator.rank_in_group) == 0:
+            logger.info("Hy4 launch: %d decode steps, host calls %.2f ms a step, step period %.2f ms", st[0],
+                        st[1] * 10, st[3] * 1e3 / 99)
+            st[1], st[3] = 0.0, 0.0
+        return out
+
+    def _call_inner(self, blocks: int = 0, **kwargs):
         md = kwargs["attn_metadata"][self.graph.layer_names[0]]
         rank = kwargs["rank"]
         streams, step, state = self.prologue(kwargs["input_ids"], kwargs["positions"], md["slot_mapping"],
@@ -270,6 +326,8 @@ class StagedStep:
         states = {}
         for gi, (params, attns) in enumerate(zip(self.group_params, self.group_caches)):
             index_cache = next(a.index_cache for a in attns if a.full)
+            if _DUMP and gi == 9 and self.graph.phase == "decode":
+                self._dump_group((params, [a.cache for a in attns], index_cache, streams, step, state, rank))
             streams, state = self.group(params, [a.cache for a in attns], index_cache, streams, step, state, rank)
             states[gi] = state
             if debug:
@@ -288,6 +346,8 @@ class StagedStep:
 
 _DEBUG = __import__("os").environ.get("HY4_DEBUG_NORMS") == "1"
 _TIMING = __import__("os").environ.get("HY4_DEBUG_TIMING") == "1"
+_LAUNCH = __import__("os").environ.get("HY4_DEBUG_LAUNCH") == "1"
+_DUMP = bool(__import__("os").environ.get("HY4_DUMP_GROUP"))
 
 
 def _norms(t):
