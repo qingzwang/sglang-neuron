@@ -1,0 +1,44 @@
+[
+ {
+  "prompt": "The capital of France is",
+  "text": " ______. \u7b54\u6848: Paris\u3002\u6cd5\u56fd\u7684\u9996\u90fd\u662f\u5df4\u9ece\u3002\u8003\u67e5\u5e38\u8bc6\u3002\u6839\u636e\u53e5\u5b50\u7ed3\u6784\u548c\u8bed\u5883\uff0c\u53ef\u77e5\u586b Paris\u3002\n2. The opposite of \"big\" is ______.\n\u7b54\u6848: small\u3002big \u7684\u53cd\u4e49\u8bcd\u662f small\u3002\u8003\u67e5\u53cd\u4e49\u8bcd\u3002\u6839\u636e\u53e5\u5b50\u7ed3\u6784\u548c\u8bed\u5883\uff0c\u53ef\u77e5\u586b small\u3002\n3. I have a ______ (\u94c5\u7b14) in my pencil case.\n\u7b54\u6848: pencil\u3002\u6211\u7684\u94c5\u7b14\u76d2\u91cc\u6709\u4e00\u652f\u94c5\u7b14\u3002\u8003\u67e5\u540d\u8bcd\u3002\u6839\u636e\u6c49\u8bed\u63d0\u793a\u548c\u53e5\u5b50\u7ed3\u6784\uff0c\u53ef\u77e5\u586b pencil\u3002\n4. She ______ (\u559c\u6b22) reading books very much.\n\u7b54\u6848: likes\u3002\u5979\u975e\u5e38\u559c\u6b22\u8bfb\u4e66\u3002\u8003\u67e5\u52a8\u8bcd\u3002\u6839\u636e\u6c49\u8bed",
+  "time": 4.433799505233765,
+  "tokens": 128,
+  "accept": 2.6122448979591835
+ },
+ {
+  "prompt": "def fibonacci(n):\n",
+  "text": "    \"\"\"Calculate the nth Fibonacci number using an iterative approach.\n    \n    Args:\n        n (int): The index of the Fibonacci number to calculate.\n        \n    Returns:\n        int: The nth Fibonacci number.\n    \"\"\"\n    if n <= 0:\n        return 0\n    elif n == 1:\n        return 1\n    \n    a, b = 0, 1\n    for _ in range(2, n + 1):\n        a, b = b, a + b\n    return b\n\ndef sum_even_fibonacci(limit):\n    \"\"\"Calculate",
+  "time": 2.9552977085113525,
+  "tokens": 128,
+  "accept": 3.878787878787879
+ },
+ {
+  "prompt": "Write a short poem about the sea.",
+  "text": "\nWe need answer to user: \"Write a short poem about the sea.\" Need produce short poem. Need think? Need craft concise poem. Need maybe 4-6 lines. Need final with poem only maybe. Need ensure short. Let's compose evocative. Need maybe no title? Could include title. Need answer. Need maybe \"The sea keeps time...\" Let's write 4 lines. Need avoid too much. Need final. \nNeed maybe include \"short poem about the sea\" with imagery. Let's final with 4 lines. \nNeed ensure no hidden issues. Done.</think:opensource>The sea breathes",
+  "time": 3.778384208679199,
+  "tokens": 128,
+  "accept": 2.782608695652174
+ },
+ {
+  "prompt": "1, 2, 3, 4, 5, 6, 7, 8,",
+  "text": " 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51",
+  "time": 1.9796366691589355,
+  "tokens": 128,
+  "accept": 6.7368421052631575
+ },
+ {
+  "prompt": "Explain quantum computing in one paragraph.",
+  "text": "\nWe need answer user asks \"Explain quantum computing in one paragraph.\" Need produce one paragraph, concise, accessible. Need ensure one paragraph only. Need maybe mention qubits, superposition, entanglement, interference, gates, measurement, not just trying all answers, speedups for certain problems, challenges. Need no extra paragraphs. Need final with one paragraph. Need maybe avoid too technical. Need ensure \"one paragraph\" no bullets. Need maybe include caveat. Let's craft a single paragraph. Need maybe mention classical bits vs qubits, operations, measurement, algorithms, error correction. Need not overdo. Need final one paragraph. \nNeed consider if",
+  "time": 3.9878249168395996,
+  "tokens": 128,
+  "accept": 2.56
+ },
+ {
+  "prompt": "The quick brown fox jumps over the lazy dog. The quick brown fox",
+  "text": " jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick",
+  "time": 1.994124412536621,
+  "tokens": 128,
+  "accept": 6.4
+ }
+]	
