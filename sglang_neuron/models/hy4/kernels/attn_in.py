@@ -54,7 +54,7 @@ def _rope(dst, src, cs, sn, T, R):
     nisa.tensor_tensor(dst=dst[0:T, 0:R], data1=a[0:T, 0:R], data2=b[0:T, 0:R], op=nl.add)
 
 
-def attn_in_decode(x, ln_w, q_a, qa_ln_w, q_b, w_uk, kv_a, kva_ln_w, cos, sin, cache, write_rows, gate=None, t_pad=0, ranks=(),
+def attn_in_decode(x, ln_w, q_a, qa_ln_w, q_b, w_uk, kv_a, kva_ln_w, cos, sin, cache, write_rows, gate=None, t_pad=0, hook=None, ranks=(),
                    eps=1e-5, lat_eps=1e-6, tag=""):
     """x [T, H] bf16 (the attention's hyper-connection input, before the norm); ln_w [1, H] bf16; q_a [H, QL] bf16;
     qa_ln_w [1, QL] bf16; q_b [QL, D] bf16 (this rank's one head: D = nope + rope); w_uk [1, nope, L] bf16; kv_a
@@ -254,6 +254,8 @@ def attn_in_decode(x, ln_w, q_a, qa_ln_w, q_b, w_uk, kv_a, kva_ln_w, cos, sin, c
         nisa.dma_copy(dst=q_lat.ap(pattern=[[QL, T], [1, QL]], offset=0), src=ql[0:T, 0:QL])
         nisa.dma_copy(dst=qloc.ap(pattern=[[L + RP, T], [1, L + RP]], offset=0), src=qq[0:T, 0:L + RP])
     nisa.core_barrier(qloc, (0, 1))
+    if hook is not None:
+        hook()  # the caller's prefetch DMAs, issued to run during the all-gather
     if group is not None:
         ncc.all_gather(srcs=[qloc], dsts=[qall], replica_group=group, collective_dim=0)
     else:

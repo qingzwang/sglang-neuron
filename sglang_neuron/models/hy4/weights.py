@@ -157,6 +157,38 @@ def experts_down_scale_loader() -> SafetensorsWeightLoader:
         [d[:].t() for d in slices]).to(torch.float32).contiguous() * 2.0)
 
 
+def experts_tp_loaders(tp: int, inner: int):
+    """The TP-16 x EP-4 decode experts' layouts (kernels/moe_tp.py, tp_layouts): rank r (index j = r % tp of its EP
+    group) holds each group expert's gate and up rows [sw j, sw j + sw) and its down columns alike, sw = inner / tp.
+    (gate_up [EL, 128, H / 128, 2 sw] partition-major, its scale [EL, H / 128, 2], down [EL, sw, H], its scale
+    [EL, H / 128]), halved for trn2 / doubled like the EP layouts."""
+    sw = inner // tp
+
+    def gate_up(slices, rank):
+        c0 = (rank % tp) * sw
+        out = []
+        for gate, up in zip(slices[0::2], slices[1::2]):
+            w = torch.cat([_t8(trn2_fp8(gate[c0:c0 + sw])), _t8(trn2_fp8(up[c0:c0 + sw]))], dim=1)  # [H, 2 sw]
+            h = w.shape[0]
+            out.append(w.view(torch.uint8).view(h // BLOCK, BLOCK, 2 * sw).permute(1, 0, 2).contiguous())
+        return torch.stack(out).view(torch.float8_e4m3fn)
+
+    def gate_up_scale(slices, rank):
+        b = (rank % tp) * sw // BLOCK
+        return torch.stack([torch.stack([gate[b:b + 1][0], up[b:b + 1][0]], dim=1)
+                            for gate, up in zip(slices[0::2], slices[1::2])]).to(torch.float32).contiguous() * 2.0
+
+    def down(slices, rank):
+        c0 = (rank % tp) * sw
+        return torch.stack([_t8(trn2_fp8(d[:, c0:c0 + sw])) for d in slices])
+
+    def down_scale(slices, rank):
+        b = (rank % tp) * sw // BLOCK
+        return torch.stack([d[:, b:b + 1][:, 0] for d in slices]).to(torch.float32).contiguous() * 2.0
+
+    return tuple(SafetensorsWeightLoader(transform=f) for f in (gate_up, gate_up_scale, down, down_scale))
+
+
 def vocab_rows_loader(rows: int, hidden_size: int) -> SafetensorsWeightLoader:
     from sglang_neuron.utils.weight_loader import pad_to_shape
 

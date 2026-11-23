@@ -346,6 +346,8 @@ _NKI_ATTN_IN = _NKI and os.environ.get("HY4_NKI_ATTN_IN", "0") == "1"  # the dec
 _NKI_ATTN_CORE = _NKI and os.environ.get("HY4_NKI_ATTN_CORE", "0") == "1"  # the decode attention core kernel
 _NKI_LAYER = _NKI and os.environ.get("HY4_NKI_LAYER", "0") == "1"  # a shared decode layer in one kernel
 _NKI_MOE_SUB = _NKI and os.environ.get("HY4_NKI_MOE_SUB", "0") == "1"  # the decode MoE sublayer kernel
+# the decode sublayer's experts sharded TP-n x EP-(ranks / n) (kernels/moe_tp.py), beside the EP layout (0: off)
+_MOE_TP = int(os.environ.get("HY4_MOE_TP", "0")) if _NKI_MOE_SUB or _NKI_LAYER else 0
 _NKI_PROJ = _NKI and os.environ.get("HY4_NKI_PROJ", "0") == "1"  # decode q_a / kv_a through kernels/gemv_wide.py
 _NKI_MOE_BLOCK = _NKI and os.environ.get("HY4_NKI_MOE_BLOCK", "0") == "1"  # off: slower in the served graph so far
 
@@ -452,6 +454,17 @@ class MoE(nn.Module):
             rows = inner * config.n_shared_experts // tp
             self.sh_gate_up_pm = nn.Parameter(torch.empty(2, weights.BLOCK, hidden * rows // weights.BLOCK, dtype=DTYPE))
             set_weight_loader(self.sh_gate_up_pm, weights.shared_pm_loader(rows))
+        if _MOE_TP:
+            # each EP group's experts, this rank's slice of each (weights.experts_tp_loaders)
+            self.tp_local = config.n_routed_experts // (tp // _MOE_TP)
+            sw, kh = inner // _MOE_TP, hidden // b
+            self.gate_up_tp = nn.Parameter(torch.empty(self.tp_local, b, kh, 2 * sw, dtype=torch.float8_e4m3fn))
+            self.gate_up_scale_tp = nn.Parameter(torch.empty(self.tp_local, kh, 2, dtype=torch.float32))
+            self.down_tp = nn.Parameter(torch.empty(self.tp_local, sw, hidden, dtype=torch.float8_e4m3fn))
+            self.down_scale_tp = nn.Parameter(torch.empty(self.tp_local, kh, dtype=torch.float32))
+            for prm, ld in zip((self.gate_up_tp, self.gate_up_scale_tp, self.down_tp, self.down_scale_tp),
+                               weights.experts_tp_loaders(_MOE_TP, inner)):
+                set_weight_loader(prm, ld)
         set_weight_loader(self.router, weights.transposed())
         set_weight_loader(self.router_bias, weights.as_float())
         set_weight_loader(self.gate_up, weights.experts_gate_up_loader())
@@ -514,6 +527,15 @@ class MoE(nn.Module):
             out = out + (h @ _dequant(self.down[e], self.down_scale[e])).float() * aff[:, e:e + 1]
         return out.to(DTYPE)
 
+    def sublayer_experts(self, rank):
+        """(base, gate_up, gate_up_scale, down, down_scale) the decode sublayer kernel takes: the EP layout, or with
+        HY4_MOE_TP the rank's EP group's TP slices (base: the group's first expert)."""
+        if _MOE_TP:
+            base = ((rank.to(torch.int32) // _MOE_TP).reshape(1, 1) * self.tp_local).contiguous()
+            return base, self.gate_up_tp, self.gate_up_scale_tp, self.down_tp, self.down_scale_tp
+        base = (rank.to(torch.int32).reshape(1, 1) * self.num_local).contiguous()
+        return base, self.gate_up, self.gate_up_scale, self.down, self.down_scale
+
     def sublayer(self, x, ln_w, rank):
         """The decode MoE sublayer in one NKI kernel (kernels/moe_sublayer.py): RMSNorm, routing, shared and routed
         experts and the all-reduce; the all-reduced output [T, H] bf16."""
@@ -522,10 +544,9 @@ class MoE(nn.Module):
         from sglang_neuron.utils.hardware_config import get_logical_nc_config
 
         cfg = self.config
-        base = (rank.to(torch.int32).reshape(1, 1) * self.num_local).contiguous()
         return wrap_nki(moe_sublayer_decode)[get_logical_nc_config()](
-            x.to(DTYPE).contiguous(), ln_w.reshape(1, -1), self.router_pm, self.router_bias.reshape(1, -1), base,
-            self.gate_up, self.gate_up_scale, self.down, self.down_scale, self.sh_gate_up_pm, self.shared.down,
+            x.to(DTYPE).contiguous(), ln_w.reshape(1, -1), self.router_pm, self.router_bias.reshape(1, -1),
+            *self.sublayer_experts(rank), self.sh_gate_up_pm, self.shared.down,
             ranks=(tuple(range(self.tp)),), top_k=cfg.num_experts_per_tok, scaling=float(cfg.routed_scaling_factor),
             limit=float(cfg.swiglu_limit or 3.0e38), eps=float(cfg.rms_norm_eps))
 
@@ -912,8 +933,7 @@ class Hy4Graph(nn.Module):
             sin.contiguous(), cache, write_rows.to(torch.int32).reshape(1, -1), slots, bias,
             onehot_rows(cfg.num_attention_heads, streams.device), attn.sinks.reshape(1, -1), attn.w_uv[0], attn.o,
             layer.post_attention_layernorm.weight.reshape(1, -1), moe.router_pm, moe.router_bias.reshape(1, -1),
-            (rank.to(torch.int32).reshape(1, 1) * moe.num_local).contiguous(), moe.gate_up, moe.gate_up_scale, moe.down,
-            moe.down_scale, moe.sh_gate_up_pm, moe.shared.down,
+            *moe.sublayer_experts(rank), moe.sh_gate_up_pm, moe.shared.down,
             ranks=(tuple(range(self.group.size)),), eps=float(cfg.rms_norm_eps), hc_eps=float(cfg.hc_eps),
             magnitude=float(cfg.hc_magnitude), scale=float(cfg.softmax_scale), top_k=cfg.num_experts_per_tok,
             scaling=float(cfg.routed_scaling_factor), limit=float(cfg.swiglu_limit or 3.0e38), t_pad=t + pad,
@@ -1165,6 +1185,15 @@ class Hy4Graph(nn.Module):
                 f"{dst}.mlp.down": [f"{m}.experts.{e}.down_proj.weight" for e in local],
                 f"{dst}.mlp.down_scale": [f"{m}.experts.{e}.down_proj.weight_scale" for e in local],
             })
+            if _MOE_TP:
+                grp = range(rank // _MOE_TP * moe.tp_local, (rank // _MOE_TP + 1) * moe.tp_local)
+                mappings.update({
+                    f"{dst}.mlp.gate_up_tp": [f"{m}.experts.{e}.{p}_proj.weight" for e in grp for p in ("gate", "up")],
+                    f"{dst}.mlp.gate_up_scale_tp": [f"{m}.experts.{e}.{p}_proj.weight_scale" for e in grp
+                                                    for p in ("gate", "up")],
+                    f"{dst}.mlp.down_tp": [f"{m}.experts.{e}.down_proj.weight" for e in grp],
+                    f"{dst}.mlp.down_scale_tp": [f"{m}.experts.{e}.down_proj.weight_scale" for e in grp],
+                })
             if moe.shared is not None:
                 mappings.update(_mlp_mappings(f"{m}.shared_experts", f"{dst}.mlp.shared"))
                 mappings[f"{dst}.mlp.sh_gate_up_pm"] = [f"{m}.shared_experts.gate_proj.weight",

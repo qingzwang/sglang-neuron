@@ -25,7 +25,8 @@ P = 128
 W = 512
 
 
-def attn_core_decode(q, cache, slots, bias, onehot, sinks, w_uv, gate_x, o, ranks=(), scale=1.0, t_real=0, tag=""):
+def attn_core_decode(q, cache, slots, bias, onehot, sinks, w_uv, gate_x, o, ranks=(), scale=1.0, t_real=0, pre=None,
+                     hooks=None, tag=""):
     """q [NB, 128, D] bf16 (every head's query, 2 tokens a row block); cache [R, D] bf16; slots [NB, S] int32 and bias
     [NB, 2, S] bf16 (mla_sparse.block_slots); onehot [2, 128] bf16; sinks [1, H] fp32 (every head's); w_uv [V, L]
     bf16 (this rank's head); gate_x [T, V] bf16 (sigmoid(x @ gate), the graph's); o [V, Hd] bf16; ranks: the attention
@@ -48,16 +49,14 @@ def attn_core_decode(q, cache, slots, bias, onehot, sinks, w_uv, gate_x, o, rank
     att = nl.ndarray((hp, 2 * NB, L), dtype=nl.float32, buffer=nl.shared_hbm, name="attn_core_att" + tag)
     red = nl.ndarray((T, Hd), dtype=nl.bfloat16, buffer=nl.shared_hbm, name="attn_core_red" + tag)
 
-    # the output projections' weights first: they stream during the attention
-    KV = V // P
-    wv = nl.ndarray((P, KV, L), dtype=w_uv.dtype, buffer=nl.sbuf)  # wv[p, j, :] = w_uv[128 j + p, :]
-    nisa.dma_copy(dst=wv[0:P, 0:KV, 0:L], src=w_uv.ap(pattern=[[L, P], [P * L, KV], [1, L]], offset=0),
-                  dge_mode=nisa.dge_mode.hwdge, engine=nisa.engine.sync)
     HH = Hd // n_prg
     h0 = pid * HH
-    owk = nl.ndarray((P, KV, HH), dtype=o.dtype, buffer=nl.sbuf)  # owk[p, j, :] = o[128 j + p, this half]
-    nisa.dma_copy(dst=owk[0:P, 0:KV, 0:HH], src=o.ap(pattern=[[Hd, P], [P * Hd, KV], [1, HH]], offset=h0),
-                  dge_mode=nisa.dge_mode.hwdge, engine=nisa.engine.scalar)
+    KV = V // P
+    if pre is not None:
+        wv, owk = pre  # prefetched by the caller (load_out_weights)
+    else:
+        # the output projections' weights first: they stream during the attention
+        wv, owk = load_out_weights(w_uv, o)
 
     # ---- this rank's partial softmax of every head (mla_sparse: out [H, 2NB, L] fp32, ml [H, 2NB, 2]) -------------
     out, ml = mla_sparse(q, cache, slots, bias, onehot, scale=scale, tag=tag)
@@ -66,6 +65,9 @@ def attn_core_decode(q, cache, slots, bias, onehot, sinks, w_uv, gate_x, o, rank
     TT = 2 * NB
 
     # ---- the statistics of every rank; each head's partial rescaled ------------------------------------------------
+    hooks = hooks or {}
+    if "ml" in hooks:
+        hooks["ml"]()  # the caller's prefetch DMAs, during the statistics' all-gather
     if group is not None:
         ncc.all_gather(srcs=[ml], dsts=[ml_all], replica_group=group, collective_dim=0)
     else:
@@ -117,6 +119,8 @@ def attn_core_decode(q, cache, slots, bias, onehot, sinks, w_uv, gate_x, o, rank
                        data2=f.ap(pattern=[[TT, H], [1, tpp], [0, L]], offset=t0), op=nl.multiply)
     nisa.dma_copy(dst=sc.ap(pattern=[[TT * L, H], [L, tpp], [1, L]], offset=t0 * L), src=po[0:H, 0:tpp, 0:L])
     nisa.core_barrier(sc, (0, 1))
+    if "rs" in hooks:
+        hooks["rs"]()
     if group is not None:
         ncc.reduce_scatter(srcs=[sc], dsts=[att], op=nl.add, replica_group=group, collective_dim=0)
     else:
@@ -168,6 +172,8 @@ def attn_core_decode(q, cache, slots, bias, onehot, sinks, w_uv, gate_x, o, rank
         nisa.tensor_copy(dst=ob[0:T, g * W:(g + 1) * W], src=op_[0:T, 0:W])
     nisa.dma_copy(dst=red.ap(pattern=[[Hd, T], [1, HH]], offset=h0), src=ob[0:T, 0:HH])
     nisa.core_barrier(red, (0, 1))
+    if "ar" in hooks:
+        hooks["ar"]()
     if group is not None:
         ncc.all_reduce(srcs=[red], dsts=[out_final], replica_group=group, op=nl.add)
     else:
@@ -175,3 +181,21 @@ def attn_core_decode(q, cache, slots, bias, onehot, sinks, w_uv, gate_x, o, rank
         nisa.dma_copy(dst=cpo[0:T, 0:HH], src=red.ap(pattern=[[Hd, T], [1, HH]], offset=h0))
         nisa.dma_copy(dst=out_final.ap(pattern=[[Hd, T], [1, HH]], offset=h0), src=cpo[0:T, 0:HH])
     return out_final
+
+
+def load_out_weights(w_uv, o):
+    """(wv [128, V / 128, L], owk [128, V / 128, Hd / n_prg]): the output projections' weights of this program, in
+    SBUF (attn_core_decode's ``pre``)."""
+    V, L = w_uv.shape
+    Hd = o.shape[1]
+    n_prg = nl.num_programs(axes=0)
+    pid = nl.program_id(axis=0)
+    KV = V // P
+    HH = Hd // n_prg
+    wv = nl.ndarray((P, KV, L), dtype=w_uv.dtype, buffer=nl.sbuf)  # wv[p, j, :] = w_uv[128 j + p, :]
+    nisa.dma_copy(dst=wv[0:P, 0:KV, 0:L], src=w_uv.ap(pattern=[[L, P], [P * L, KV], [1, L]], offset=0),
+                  dge_mode=nisa.dge_mode.hwdge, engine=nisa.engine.sync)
+    owk = nl.ndarray((P, KV, HH), dtype=o.dtype, buffer=nl.sbuf)  # owk[p, j, :] = o[128 j + p, this half]
+    nisa.dma_copy(dst=owk[0:P, 0:KV, 0:HH], src=o.ap(pattern=[[Hd, P], [P * Hd, KV], [1, HH]], offset=pid * HH),
+                  dge_mode=nisa.dge_mode.hwdge, engine=nisa.engine.scalar)
+    return wv, owk

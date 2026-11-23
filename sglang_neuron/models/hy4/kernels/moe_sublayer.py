@@ -26,6 +26,8 @@ import nki.isa as nisa
 import nki.language as nl
 from nki.collectives import ReplicaGroup
 
+from sglang_neuron.models.hy4.kernels.moe_tp import CH as TP_CH
+from sglang_neuron.models.hy4.kernels.moe_tp import tp_routed
 from sglang_neuron.models.hy4.kernels.moe_wide import GW, KB_DMA, NT, TILE, W
 
 P = 128
@@ -33,7 +35,7 @@ DMA_ENGINES = (nisa.engine.sync, nisa.engine.scalar)
 
 
 def moe_sublayer_decode(x, ln_w, router_pm, router_bias, base, gate_up, gate_up_scale, down, down_scale, sh_gate_up_pm,
-                        sh_down, ranks=(), top_k=8, scaling=1.0, limit=10.0, eps=1e-6, tag=""):
+                        sh_down, ranks=(), top_k=8, scaling=1.0, limit=10.0, eps=1e-6, pre=None, tag=""):
     """x [T, H] bf16 (the MLP's hyper-connection input, before the norm); ln_w [1, H] bf16; router_pm [128, KH * NE]
     bf16 (router_partition_major); router_bias [1, NE] fp32; base [1, 1] int32 (this rank's first expert);
     gate_up [E, H, 2I] / gate_up_scale / down / down_scale (moe_wide's); sh_gate_up_pm [n_prg, 128, KH * 2 RH] bf16
@@ -42,6 +44,9 @@ def moe_sublayer_decode(x, ln_w, router_pm, router_bias, base, gate_up, gate_up_
     T, H = x.shape
     KH = H // P
     NE = router_bias.shape[1]
+    # TP-16 x EP-4 experts (moe_tp.py layouts: gate_up 4-dimensional): this rank holds a slice of each of its EP
+    # group's E experts; base is the group's first expert
+    TPM = len(gate_up.shape) == 4
     E, I, _ = down.shape  # noqa: E741
     RS = sh_down.shape[0]
     n_prg = nl.num_programs(axes=0)
@@ -63,24 +68,15 @@ def moe_sublayer_decode(x, ln_w, router_pm, router_bias, base, gate_up, gate_up_
 
     out = nl.ndarray((T, H), dtype=nl.bfloat16, buffer=nl.shared_hbm, name="moe_sub_out" + tag)
     red = nl.ndarray((T, H), dtype=nl.bfloat16, buffer=nl.shared_hbm, name="moe_sub_red" + tag)
-    hx = nl.ndarray((n_prg, P, KI * T), dtype=nl.bfloat16, buffer=nl.shared_hbm, name="moe_sub_hx" + tag)
+    if not TPM:
+        hx = nl.ndarray((n_prg, P, KI * T), dtype=nl.bfloat16, buffer=nl.shared_hbm, name="moe_sub_hx" + tag)
     sx = nl.ndarray((RS, T), dtype=nl.bfloat16, buffer=nl.shared_hbm, name="moe_sub_sx" + tag)
 
-    # ---- the router's and the shared expert's weights first: they stream while the norm runs -------------------
-    rw = nl.ndarray((P, KH, NE), dtype=router_pm.dtype, buffer=nl.sbuf)
-    half = KH // 2
-    for j, eng in enumerate(DMA_ENGINES):
-        nisa.dma_copy(dst=rw[0:P, j * half:(j + 1) * half, 0:NE],
-                      src=router_pm.ap(pattern=[[KH * NE, P], [NE, half], [1, NE]], offset=j * half * NE),
-                      dge_mode=nisa.dge_mode.hwdge, engine=eng)
-    sw = nl.ndarray((P, KH, 2 * RH), dtype=sh_gate_up_pm.dtype, buffer=nl.sbuf)
-    nisa.dma_copy(dst=sw[0:P, 0:KH, 0:2 * RH],
-                  src=sh_gate_up_pm.ap(pattern=[[KH * 2 * RH, P], [2 * RH, KH], [1, 2 * RH]],
-                                       offset=pid * P * KH * 2 * RH),
-                  dge_mode=nisa.dge_mode.hwdge, engine=nisa.engine.sync)
-    sd = nl.ndarray((RS, HH), dtype=sh_down.dtype, buffer=nl.sbuf)
-    nisa.dma_copy(dst=sd[0:RS, 0:HH], src=sh_down.ap(pattern=[[H, RS], [1, HH]], offset=h0),
-                  dge_mode=nisa.dge_mode.hwdge, engine=nisa.engine.scalar)
+    if pre is not None:
+        rw, sw, sd = pre  # prefetched by the caller (load_router_shared)
+    else:
+        # the router's and the shared expert's weights first: they stream while the norm runs
+        rw, sw, sd = load_router_shared(router_pm, sh_gate_up_pm, sh_down, KH, NE, RS)
 
     # ---- the tokens transposed (xr[p, kb, t] = x[t, 128 kb + p]), then RMSNorm in that layout ---------------------
     xt = nl.ndarray((T, H), dtype=x.dtype, buffer=nl.sbuf)
@@ -173,11 +169,25 @@ def moe_sublayer_decode(x, ln_w, router_pm, router_bias, base, gate_up, gate_up_
     rel = nl.ndarray((T, top_k), dtype=nl.float32, buffer=nl.sbuf)
     nisa.tensor_scalar(dst=rel[0:T, 0:top_k], data=idf[0:T, 0:top_k], op0=nl.subtract, operand0=bf[0:T, 0:1])
     A = nl.ndarray((T, E), dtype=nl.float32, buffer=nl.sbuf)
-    for e in range(E):
-        m = nl.ndarray((T, top_k), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_scalar(dst=m[0:T, 0:top_k], data=rel[0:T, 0:top_k], op0=nl.equal, operand0=float(e))
-        nisa.tensor_tensor(dst=m[0:T, 0:top_k], data1=m[0:T, 0:top_k], data2=chn[0:T, 0:top_k], op=nl.multiply)
-        nisa.tensor_reduce(dst=A[0:T, e:e + 1], op=nl.add, data=m[0:T, 0:top_k], axis=1)
+    if E <= 8:
+        for e in range(E):
+            m = nl.ndarray((T, top_k), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_scalar(dst=m[0:T, 0:top_k], data=rel[0:T, 0:top_k], op0=nl.equal, operand0=float(e))
+            nisa.tensor_tensor(dst=m[0:T, 0:top_k], data1=m[0:T, 0:top_k], data2=chn[0:T, 0:top_k], op=nl.multiply)
+            nisa.tensor_reduce(dst=A[0:T, e:e + 1], op=nl.add, data=m[0:T, 0:top_k], axis=1)
+    else:
+        # many local experts (an EP group's): A[t, e] = sum_k chn[t, k] [rel[t, k] == e], three instructions
+        evi = nl.ndarray((T, top_k, E), dtype=nl.int32, buffer=nl.sbuf)
+        nisa.iota(dst=evi[0:T, 0:top_k, 0:E], pattern=[[0, top_k], [1, E]], offset=0)
+        ev = nl.ndarray((T, top_k, E), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=ev[0:T, 0:top_k, 0:E], src=evi[0:T, 0:top_k, 0:E])
+        mm = nl.ndarray((T, top_k, E), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_tensor(dst=mm[0:T, 0:top_k, 0:E], data1=ev[0:T, 0:top_k, 0:E],
+                           data2=rel.ap(pattern=[[top_k, T], [1, top_k], [0, E]], offset=0), op=nl.equal)
+        nisa.tensor_tensor(dst=mm[0:T, 0:top_k, 0:E], data1=mm[0:T, 0:top_k, 0:E],
+                           data2=chn.ap(pattern=[[top_k, T], [1, top_k], [0, E]], offset=0), op=nl.multiply)
+        nisa.tensor_reduce(dst=A[0:T, 0:E], op=nl.add, data=mm.ap(pattern=[[top_k * E, T], [1, E], [E, top_k]],
+                                                                    offset=0), axis=2)
     # affT [E, T] (the expert loop reads its expert's row) and the hit experts' list
     affT = nl.ndarray((E, T), dtype=nl.float32, buffer=nl.private_hbm, name="moe_sub_aff" + tag)
     nisa.dma_copy(dst=affT.ap(pattern=[[1, T], [T, E]], offset=0), src=A[0:T, 0:E])
@@ -191,11 +201,23 @@ def moe_sublayer_decode(x, ln_w, router_pm, router_bias, base, gate_up, gate_up_
     nisa.memset(dst=hf[0:P, 0:E], value=0.0)
     nisa.tensor_scalar(dst=hf[0:1, 0:E], data=cnt_ps[0:1, 0:E], op0=nl.minimum, operand0=1.0)
     nz = nl.ndarray((P, E + 1), dtype=nl.int32, buffer=nl.sbuf)
-    nisa.nonzero_with_count(dst=nz[0:P, 0:E + 1], src=hf[0:P, 0:E], index_offset=0, padding_val=0)
-    hits = nl.ndarray((1, E + 1), dtype=nl.int32, buffer=nl.private_hbm, name="moe_sub_hits" + tag)
-    nisa.dma_copy(dst=hits.ap(pattern=[[E + 1, 1], [1, E + 1]], offset=0), src=nz[0:1, 0:E + 1])
+    nisa.nonzero_with_count(dst=nz[0:P, 0:E + 1], src=hf[0:P, 0:E], index_offset=0, padding_val=E if TPM else 0)
     n_reg = nisa.register_alloc()
-    nisa.register_load(n_reg, nz[0:1, E:E + 1])
+    if TPM:
+        # the hit list padded with out-of-range slots (E), and its chunks: (count + CH - 1) >> 3
+        hits = nl.ndarray((1, E + TP_CH), dtype=nl.int32, buffer=nl.private_hbm, name="moe_sub_hits" + tag)
+        hl = nl.ndarray((1, E + TP_CH), dtype=nl.int32, buffer=nl.sbuf)
+        nisa.memset(dst=hl[0:1, E:E + TP_CH], value=E)
+        nisa.tensor_copy(dst=hl[0:1, 0:E], src=nz[0:1, 0:E])
+        nisa.dma_copy(dst=hits.ap(pattern=[[E + TP_CH, 1], [1, E + TP_CH]], offset=0), src=hl[0:1, 0:E + TP_CH])
+        ncw = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.sbuf)
+        nisa.tensor_scalar(dst=ncw[0:1, 0:1], data=nz[0:1, E:E + 1], op0=nl.add, operand0=TP_CH - 1)
+        nisa.tensor_scalar(dst=ncw[0:1, 0:1], data=ncw[0:1, 0:1], op0=nl.right_shift, operand0=3)
+        nisa.register_load(n_reg, ncw)
+    else:
+        hits = nl.ndarray((1, E + 1), dtype=nl.int32, buffer=nl.private_hbm, name="moe_sub_hits" + tag)
+        nisa.dma_copy(dst=hits.ap(pattern=[[E + 1, 1], [1, E + 1]], offset=0), src=nz[0:1, 0:E + 1])
+        nisa.register_load(n_reg, nz[0:1, E:E + 1])
     slot = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.sbuf)
     nisa.memset(dst=slot[0:1, 0:1], value=0)
 
@@ -311,7 +333,10 @@ def moe_sublayer_decode(x, ln_w, router_pm, router_bias, base, gate_up, gate_up_
                                data2=pd[c * TILE:c * TILE + S, r, 0:W], op=nl.add)
         nisa.tensor_scalar(dst=slot[0:1, 0:1], data=slot[0:1, 0:1], op0=nl.add, operand0=1)
 
-    nl.fori_loop(0, n_reg, expert_body)
+    if TPM:
+        tp_routed(xs, affT, hits, n_reg, gate_up, gate_up_scale, down, down_scale, acc, limit=limit, tag=tag)
+    else:
+        nl.fori_loop(0, n_reg, expert_body)
 
     # ---- bf16, this program's hidden half of the result (the diagonal), all-reduced --------------------------------
     accb = nl.ndarray((P, R, W), dtype=nl.bfloat16, buffer=nl.sbuf)
@@ -351,3 +376,28 @@ def shared_partition_major(gate_up, n_prg: int = 2):
     lay = shared_gate_up_layout(gate_up, n_prg)  # [H, n_prg, 2 RH]
     H = lay.shape[0]
     return lay.view(H // P, P, n_prg, -1).permute(2, 1, 0, 3).contiguous().view(n_prg, P, -1)
+
+
+def load_router_shared(router_pm, sh_gate_up_pm, sh_down, KH, NE, RS):
+    """(rw, sw, sd): the router's and the shared expert's weights of this program in SBUF (moe_sublayer_decode's
+    ``pre``)."""
+    n_prg = nl.num_programs(axes=0)
+    pid = nl.program_id(axis=0)
+    RH = RS // n_prg
+    H = KH * P
+    HH = H // n_prg
+    rw = nl.ndarray((P, KH, NE), dtype=router_pm.dtype, buffer=nl.sbuf)
+    half = KH // 2
+    for j, eng in enumerate(DMA_ENGINES):
+        nisa.dma_copy(dst=rw[0:P, j * half:(j + 1) * half, 0:NE],
+                      src=router_pm.ap(pattern=[[KH * NE, P], [NE, half], [1, NE]], offset=j * half * NE),
+                      dge_mode=nisa.dge_mode.hwdge, engine=eng)
+    sw = nl.ndarray((P, KH, 2 * RH), dtype=sh_gate_up_pm.dtype, buffer=nl.sbuf)
+    nisa.dma_copy(dst=sw[0:P, 0:KH, 0:2 * RH],
+                  src=sh_gate_up_pm.ap(pattern=[[KH * 2 * RH, P], [2 * RH, KH], [1, 2 * RH]],
+                                       offset=pid * P * KH * 2 * RH),
+                  dge_mode=nisa.dge_mode.hwdge, engine=nisa.engine.sync)
+    sd = nl.ndarray((RS, HH), dtype=sh_down.dtype, buffer=nl.sbuf)
+    nisa.dma_copy(dst=sd[0:RS, 0:HH], src=sh_down.ap(pattern=[[H, RS], [1, HH]], offset=pid * HH),
+                  dge_mode=nisa.dge_mode.hwdge, engine=nisa.engine.scalar)
+    return rw, sw, sd
