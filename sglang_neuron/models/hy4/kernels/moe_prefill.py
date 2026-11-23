@@ -181,8 +181,19 @@ def moe_blocks(aff, P: int = 128, top_k: int = 0):
     nbe = (count + P - 1) // P
     start = torch.cumsum(nbe, 0) - nbe
     ar = torch.arange(T, device=aff.device)
-    # each expert's routed tokens first, in token order
-    order = torch.argsort((~routed).to(torch.int32) * T + ar[:, None], dim=0)
+    # each expert's routed tokens first, in token order: orderT[e] lists expert e's routed tokens
+    if aff.device.type != "cpu" and T % P == 0:
+        # the compaction kernel (GpSimd nonzero_with_count a row) instead of an XLA argsort over [T, E]
+        from sglang_neuron.backend.stack import wrap_nki
+        from sglang_neuron.models.hy4.kernels.decode_compact import decode_compact
+        from sglang_neuron.utils.hardware_config import get_logical_nc_config
+
+        orderT, _ = wrap_nki(decode_compact)[get_logical_nc_config()](
+            routed.t().contiguous().to(torch.float32), ar.to(torch.int32)[None, :].expand(E, T).contiguous(),
+            cap=T, pad_row=0)
+        orderT = orderT.to(torch.int64)
+    else:
+        orderT = torch.argsort((~routed).to(torch.int32) * T + ar[:, None], dim=0).t()
     b = torch.arange(NB, device=aff.device)
     # the block's expert: the last expert with blocks that starts at or before it (experts without tokens own none)
     owns = (b[:, None] >= start[None, :]) & (nbe[None, :] > 0)
@@ -190,7 +201,7 @@ def moe_blocks(aff, P: int = 128, top_k: int = 0):
     be = be.amax(1).clamp(min=0)
     pos = (b - start[be])[:, None] * P + torch.arange(P, device=aff.device)[None, :]
     live = (b < nbe.sum())[:, None] & (pos >= 0) & (pos < count[be][:, None])
-    tokidx = order.t().reshape(-1)[be[:, None] * T + pos.clamp(min=0, max=T - 1)]
+    tokidx = orderT.reshape(-1)[be[:, None] * T + pos.clamp(min=0, max=T - 1)]
     tok = torch.where(live, tokidx, torch.full_like(tokidx, T))
     a = torch.where(live, aff[tok.clamp(max=T - 1), be[:, None].expand(-1, P)], torch.zeros_like(pos, dtype=aff.dtype))
     tok_out = torch.stack([torch.where(live, tok, torch.full_like(tok, 2 * T)),
