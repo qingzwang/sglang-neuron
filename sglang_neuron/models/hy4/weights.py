@@ -189,6 +189,20 @@ def experts_tp_loaders(tp: int, inner: int):
     return tuple(SafetensorsWeightLoader(transform=f) for f in (gate_up, gate_up_scale, down, down_scale))
 
 
+def qkv_shard_loader(config: Hy4Config, heads: int, tp: int) -> SafetensorsWeightLoader:
+    """kernels/attn_in.py's ``qkv_sh``: this rank's q_a / kv_a columns and its gate, partition-major. The mapping
+    lists q_a_proj, kv_a_proj_with_mqa, then linear_gate's slices (as gate_loader's)."""
+    from sglang_neuron.models.hy4.kernels.attn_in import qkv_shard_layout
+
+    kv, gate = kv_a_loader(config), gate_loader(config, heads)
+
+    def transform(slices, rank):
+        q_a = slices[0][:].t()
+        return qkv_shard_layout(q_a, kv.transform(slices[1:2], rank), gate.transform(slices[2:], rank), rank, tp)
+
+    return SafetensorsWeightLoader(transform=transform)
+
+
 def vocab_rows_loader(rows: int, hidden_size: int) -> SafetensorsWeightLoader:
     from sglang_neuron.utils.weight_loader import pad_to_shape
 

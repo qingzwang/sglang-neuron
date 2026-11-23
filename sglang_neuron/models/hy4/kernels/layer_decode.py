@@ -27,7 +27,7 @@ def layer_decode(streams, p_out, p_post, fn_a, aff_a, fn_m, aff_m, ones, place,
                  ln1, q_a, qa_ln, q_b, w_uk, kv_a, kva_ln, gate, cos, sin, cache, write_rows, slots, bias, onehot, sinks,
                  w_uv, o, ln2, router_pm, router_bias, base, gate_up, gate_up_scale, down, down_scale, sh_pm, sh_down,
                  ranks=(), eps=1e-5, hc_eps=1e-6, magnitude=1.0, scale=1.0, top_k=8, scaling=1.0, limit=10.0, t_pad=0,
-                 tag=""):
+                 qkv_sh=None, tag=""):
     """streams [T, n H] bf16; p_out [T, H] bf16 and p_post [T, n] fp32: the last layer's MLP output and its post
     weights (zeros: none); the rest as the stage kernels take them -> (streams' [T, n H] bf16, the MLP output [T, H]
     bf16 (all-reduced), its post weights [T, n] fp32, cache)."""
@@ -51,7 +51,7 @@ def layer_decode(streams, p_out, p_post, fn_a, aff_a, fn_m, aff_m, ones, place,
 
     query, compact, q_lat, cache, gate_x = attn_in_decode(x, ln1, q_a, qa_ln, q_b, w_uk, kv_a, kva_ln, cos, sin, cache,
                                                           write_rows, gate=gate, t_pad=t_pad, hook=fetch_out,
-                                                          ranks=ranks, eps=eps, lat_eps=eps, tag=tag)
+                                                          ranks=ranks, eps=eps, lat_eps=eps, qkv_sh=qkv_sh, tag=tag)
     nisa.core_barrier(query, (0, 1))
     nisa.core_barrier(gate_x, (0, 1))
     # the rows attn_in wrote (both programs, in place) before attn_core gathers keys from them: an indirect gather

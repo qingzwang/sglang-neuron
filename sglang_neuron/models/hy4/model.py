@@ -183,6 +183,11 @@ class Attention(nn.Module):
         self.o = nn.Parameter(torch.empty(heads * config.v_head_dim, hidden, dtype=DTYPE))
         # every head's sink: the merge counts each head's once
         self.sinks = nn.Parameter(torch.empty(config.num_attention_heads, dtype=torch.float32))
+        if _QKV_SH and full is None:  # (a DFly draft layer's attention runs none of the decode kernels)
+            # this rank's q_a / kv_a columns and gate, partition-major (kernels/attn_in.qkv_shard_layout)
+            cs = config.q_lora_rank // tp + config.compact_dim // tp + heads * config.v_head_dim
+            self.qkv_sh = nn.Parameter(torch.empty(weights.BLOCK, hidden // weights.BLOCK, cs, dtype=DTYPE))
+            set_weight_loader(self.qkv_sh, weights.qkv_shard_loader(config, heads, tp))
         set_weight_loader(self.q_a, weights.transposed())
         set_weight_loader(self.q_b, weights.q_b_loader(config, heads))
         set_weight_loader(self.kv_a, weights.kv_a_loader(config))
@@ -247,7 +252,8 @@ class Attention(nn.Module):
             x_raw.to(DTYPE).contiguous(), ln_w.reshape(1, -1), self.q_a, self.q_a_layernorm.weight.reshape(1, -1),
             self.q_b, self.w_uk, self.kv_a, self.kv_a_layernorm.weight.reshape(1, -1), cos.contiguous(),
             sin.contiguous(), cache, write_rows.to(torch.int32).reshape(1, -1),
-            ranks=(tuple(range(self.group.size)),), eps=float(cfg.rms_norm_eps), lat_eps=float(self.q_a_layernorm.eps))
+            ranks=(tuple(range(self.group.size)),), eps=float(cfg.rms_norm_eps), lat_eps=float(self.q_a_layernorm.eps),
+            qkv_sh=getattr(self, "qkv_sh", None))
         return q, compact, q_lat
 
     def index_project(self, x, q_lat, cos, sin):
@@ -344,6 +350,8 @@ _NKI_COMPACT = _NKI and os.environ.get("HY4_NKI_COMPACT", "1") != "0"
 _NKI_HC_DECODE = _NKI and os.environ.get("HY4_NKI_HC_DECODE", "1") != "0"
 _HC_CHAIN = os.environ.get("HY4_HC_CHAIN", "0") == "1"  # the decode's layer-boundary HC post + pre in one kernel
 _NKI_ATTN_IN = _NKI and os.environ.get("HY4_NKI_ATTN_IN", "0") == "1"  # the decode attention input kernel
+# its q_a / kv_a sharded over the attention TP (kernels/attn_in.py qkv_sh; the prefill keeps the replicated ones)
+_QKV_SH = _NKI_ATTN_IN and os.environ.get("HY4_QKV_SH", "0") == "1"
 _NKI_ATTN_CORE = _NKI and os.environ.get("HY4_NKI_ATTN_CORE", "0") == "1"  # the decode attention core kernel
 _NKI_LAYER = _NKI and os.environ.get("HY4_NKI_LAYER", "0") == "1"  # a shared decode layer in one kernel
 _NKI_MOE_SUB = _NKI and os.environ.get("HY4_NKI_MOE_SUB", "0") == "1"  # the decode MoE sublayer kernel
@@ -969,7 +977,7 @@ class Hy4Graph(nn.Module):
             ranks=(tuple(range(self.group.size)),), eps=float(cfg.rms_norm_eps), hc_eps=float(cfg.hc_eps),
             magnitude=float(cfg.hc_magnitude), scale=float(cfg.softmax_scale), top_k=cfg.num_experts_per_tok,
             scaling=float(cfg.routed_scaling_factor), limit=float(cfg.swiglu_limit or 3.0e38), t_pad=t + pad,
-            tag=f"_l{attn.layer_idx}")
+            qkv_sh=getattr(attn, "qkv_sh", None), tag=f"_l{attn.layer_idx}")
         return new.reshape(streams.shape), out, post
 
     def defers_hc(self, streams) -> bool:
@@ -1189,6 +1197,9 @@ class Hy4Graph(nn.Module):
                 f"{dst}.self_attn.w_uv": f"{a}.kv_b_proj.weight",
                 f"{dst}.self_attn.gate": ([f"{a}.linear_gate.weight", f"{a}.linear_gate.weight_scale"] if fp8
                                           else [f"{a}.linear_gate.weight"]),
+                **({f"{dst}.self_attn.qkv_sh": [f"{a}.q_a_proj.weight", f"{a}.kv_a_proj_with_mqa.weight"] + (
+                    [f"{a}.linear_gate.weight", f"{a}.linear_gate.weight_scale"] if fp8
+                    else [f"{a}.linear_gate.weight"])} if hasattr(layer.self_attn, "qkv_sh") else {}),
                 f"{dst}.self_attn.o": ([f"{a}.o_proj.weight", f"{a}.o_proj.weight_scale"] if fp8
                                        else [f"{a}.o_proj.weight"]),
                 f"{dst}.self_attn.sinks": f"{a}.learnable_sink_param",

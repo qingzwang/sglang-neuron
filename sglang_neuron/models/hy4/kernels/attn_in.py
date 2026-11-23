@@ -55,7 +55,7 @@ def _rope(dst, src, cs, sn, T, R):
 
 
 def attn_in_decode(x, ln_w, q_a, qa_ln_w, q_b, w_uk, kv_a, kva_ln_w, cos, sin, cache, write_rows, gate=None, t_pad=0, hook=None, ranks=(),
-                   eps=1e-5, lat_eps=1e-6, tag=""):
+                   eps=1e-5, lat_eps=1e-6, qkv_sh=None, tag=""):
     """x [T, H] bf16 (the attention's hyper-connection input, before the norm); ln_w [1, H] bf16; q_a [H, QL] bf16;
     qa_ln_w [1, QL] bf16; q_b [QL, D] bf16 (this rank's one head: D = nope + rope); w_uk [1, nope, L] bf16; kv_a
     [H, L + rope] bf16 (rope rows in halves); kva_ln_w [1, L] bf16; cos, sin [T, rope] bf16; ranks: the attention TP
@@ -63,7 +63,12 @@ def attn_in_decode(x, ln_w, q_a, qa_ln_w, q_b, w_uk, kv_a, kva_ln_w, cos, sin, c
     [1, T] int32 (each token's row, 0 where another rank owns it): the compact rows are written there as soon as they
     are computed (wrap_nki with alias_outputs_in_place) -> (query [T, ranks, L + rope] bf16 (rank r's head r), compact
     [T, L + rope] bf16, q_lat [T, QL] bf16, cache[, gate_x]): with ``gate`` [H, V] bf16 (the output gate's columns of
-    this rank) also gate_x = sigmoid(xn @ gate) [T, V] bf16, its projection in the same weight pass."""
+    this rank) also gate_x = sigmoid(xn @ gate) [T, V] bf16, its projection in the same weight pass.
+
+    ``qkv_sh`` [128, H / 128, CQ + CK + V] bf16 (qkv_shard_layout): q_a and kv_a sharded over the attention TP
+    instead of replicated: this rank's CQ = QL / ranks columns of q_a, CK = NKV / ranks of kv_a and its gate columns,
+    partition-major. Each rank projects its columns (0.5 MB of weights instead of 32 MB) and an all-gather of the
+    [T, CQ + CK] slices assembles the latents on every rank (q_a and kv_a are then not read)."""
     T, H = x.shape
     QL = q_a.shape[1]
     NKV = kv_a.shape[1]
@@ -93,30 +98,44 @@ def attn_in_decode(x, ln_w, q_a, qa_ln_w, q_b, w_uk, kv_a, kva_ln_w, cos, sin, c
     qloc = nl.ndarray((T, L + RP), dtype=nl.bfloat16, buffer=nl.shared_hbm, name="attn_in_qloc" + tag)
     qall = nl.ndarray((nr, T, L + RP), dtype=nl.bfloat16, buffer=nl.shared_hbm, name="attn_in_qall" + tag)
 
-    # ---- this program's columns of [q_a | kv_a], in chunks of <= 512 (one column tile each) ----------------------
-    qn, kn = QL // n_prg, NKV // n_prg
-    # (weight, its first column, width, the column in pj)
-    chunks = [(q_a, pid * qn + s0, min(W, qn - s0), pid * qn + s0) for s0 in range(0, qn, W)]
-    chunks += [(kv_a, pid * kn + s0, min(W, kn - s0), QL + pid * kn + s0) for s0 in range(0, kn, W)]
-    if gate is not None:
-        gn = NG_ // n_prg
-        chunks += [(gate, pid * gn + s0, min(W, gn - s0), QL + NKV + pid * gn + s0) for s0 in range(0, gn, W)]
-    NC = len(chunks)
-    # the weights' first row blocks first: they stream while the norm runs
-    bufs = {}
+    SH = qkv_sh is not None
+    if SH:
+        CS = qkv_sh.shape[2]
+        CQ, CK = QL // nr, NKV // nr
+        # (the pack's last columns are the gate's: NG_ of them, used when ``gate`` is given)
+        KHH = KH // n_prg  # this program's row blocks
+        wsh = nl.ndarray((P, KHH, CS), dtype=qkv_sh.dtype, buffer=nl.sbuf)
+        nisa.dma_copy(dst=wsh[0:P, 0:KHH, 0:CS], src=qkv_sh.ap(pattern=[[KH * CS, P], [1, KHH * CS]],
+                                                                 offset=pid * KHH * CS),
+                      dge_mode=nisa.dge_mode.hwdge, engine=DMA_ENGINES[pid % 2])
+        part = nl.ndarray((n_prg, T, CS), dtype=nl.float32, buffer=nl.shared_hbm, name="attn_in_part" + tag)
+        sloc = nl.ndarray((T, CQ + CK), dtype=nl.bfloat16, buffer=nl.shared_hbm, name="attn_in_sloc" + tag)
+        sall = nl.ndarray((nr, T, CQ + CK), dtype=nl.bfloat16, buffer=nl.shared_hbm, name="attn_in_sall" + tag)
+    else:
+        # ---- this program's columns of [q_a | kv_a], in chunks of <= 512 (one column tile each) ----------------------
+        qn, kn = QL // n_prg, NKV // n_prg
+        # (weight, its first column, width, the column in pj)
+        chunks = [(q_a, pid * qn + s0, min(W, qn - s0), pid * qn + s0) for s0 in range(0, qn, W)]
+        chunks += [(kv_a, pid * kn + s0, min(W, kn - s0), QL + pid * kn + s0) for s0 in range(0, kn, W)]
+        if gate is not None:
+            gn = NG_ // n_prg
+            chunks += [(gate, pid * gn + s0, min(W, gn - s0), QL + NKV + pid * gn + s0) for s0 in range(0, gn, W)]
+        NC = len(chunks)
+        # the weights' first row blocks first: they stream while the norm runs
+        bufs = {}
 
-    def load(kb):
-        out = []
-        for i, (w, c0, width, _) in enumerate(chunks):
-            N = w.shape[1]
-            b = nl.ndarray((P, KB_DMA, W), dtype=w.dtype, buffer=nl.sbuf)
-            nisa.dma_copy(dst=b[0:P, 0:KB_DMA, 0:width], src=w.ap(pattern=[[N, P], [P * N, KB_DMA], [1, width]],
-                                                                    offset=kb * P * N + c0),
-                          dge_mode=nisa.dge_mode.hwdge, engine=DMA_ENGINES[(kb // KB_DMA + i) % 2])
-            out.append(b)
-        return out
+        def load(kb):
+            out = []
+            for i, (w, c0, width, _) in enumerate(chunks):
+                N = w.shape[1]
+                b = nl.ndarray((P, KB_DMA, W), dtype=w.dtype, buffer=nl.sbuf)
+                nisa.dma_copy(dst=b[0:P, 0:KB_DMA, 0:width], src=w.ap(pattern=[[N, P], [P * N, KB_DMA], [1, width]],
+                                                                        offset=kb * P * N + c0),
+                              dge_mode=nisa.dge_mode.hwdge, engine=DMA_ENGINES[(kb // KB_DMA + i) % 2])
+                out.append(b)
+            return out
 
-    bufs[0] = load(0)
+        bufs[0] = load(0)
 
     # ---- the tokens transposed (xr[p, kb, t] = x[t, 128 kb + p]), then RMSNorm in that layout ---------------------
     xt = nl.ndarray((T, H), dtype=x.dtype, buffer=nl.sbuf)
@@ -156,24 +175,60 @@ def attn_in_decode(x, ln_w, q_a, qa_ln_w, q_b, w_uk, kv_a, kva_ln_w, cos, sin, c
                        data2=wpk.ap(pattern=[[KH, P], [1, KH], [0, T]], offset=0), op=nl.multiply)
 
     TA = T + T % 2
-    # ---- the projections ---------------------------------------------------------------------------------------------
-    ps = [nl.ndarray((P, W), dtype=nl.float32, buffer=nl.psum) for _ in range(NC)]
-    for kb in range(KH):
-        if kb % KB_DMA == 0 and kb not in bufs:
-            bufs[kb] = load(kb)
-        b = bufs[kb - kb % KB_DMA]
-        for c, (w, c0, width, _) in enumerate(chunks):
-            nisa.nc_matmul(dst=ps[c][c * TILE:c * TILE + T, 0:width], stationary=xs[0:P, kb, 0:T],
-                           moving=b[c][0:P, kb % KB_DMA, 0:width], tile_position=(0, c * TILE),
-                           tile_size=(P, TILE), accumulate=None)
-    for c, (w, c0, width, o0) in enumerate(chunks):
-        ob = nl.ndarray((P, W), dtype=nl.bfloat16, buffer=nl.sbuf)
-        nisa.tensor_copy(dst=ob[c * TILE:c * TILE + T, 0:width], src=ps[c][c * TILE:c * TILE + T, 0:width])
-        nisa.dma_copy(dst=pj.ap(pattern=[[PJ, T], [1, width]], offset=o0),
-                      src=ob[c * TILE:c * TILE + T, 0:width], dge_mode=nisa.dge_mode.hwdge, engine=DMA_ENGINES[c % 2])
-    nisa.core_barrier(pj, (0, 1))
-    pr = nl.ndarray((T, PJ), dtype=nl.bfloat16, buffer=nl.sbuf)
-    nisa.dma_copy(dst=pr[0:T, 0:PJ], src=pj.ap(pattern=[[PJ, T], [1, PJ]], offset=0))
+    if SH:
+        # ---- this rank's columns: each program half the row blocks, the fp32 halves summed ----------------------------
+        pf = nl.ndarray((T, CS), dtype=nl.float32, buffer=nl.sbuf)
+        for c0 in range(0, CS, W):  # (one column tile in the served layout: CS = 169)
+            cw = min(W, CS - c0)
+            pp = nl.ndarray((T, W), dtype=nl.float32, buffer=nl.psum)
+            for k in range(KHH):
+                nisa.nc_matmul(dst=pp[0:T, 0:cw], stationary=xs[0:P, pid * KHH + k, 0:T],
+                               moving=wsh[0:P, k, c0:c0 + cw], accumulate=(k > 0))
+            nisa.tensor_copy(dst=pf[0:T, c0:c0 + cw], src=pp[0:T, 0:cw])
+        nisa.dma_copy(dst=part.ap(pattern=[[CS, T], [1, CS]], offset=pid * T * CS), src=pf[0:T, 0:CS])
+        nisa.core_barrier(part, (0, 1))
+        pa = nl.ndarray((T, n_prg, CS), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.dma_copy(dst=pa[0:T, 0:n_prg, 0:CS], src=part.ap(pattern=[[CS, T], [T * CS, n_prg], [1, CS]], offset=0))
+        sb = nl.ndarray((T, CS), dtype=nl.bfloat16, buffer=nl.sbuf)
+        nisa.tensor_reduce(dst=sb[0:T, 0:CS], op=nl.add, data=pa.ap(pattern=[[n_prg * CS, T], [1, CS], [CS, n_prg]],
+                                                                       offset=0), axis=2)
+        if pid == 0:
+            nisa.dma_copy(dst=sloc.ap(pattern=[[CQ + CK, T], [1, CQ + CK]], offset=0), src=sb[0:T, 0:CQ + CK])
+        nisa.core_barrier(sloc, (0, 1))
+        if group is not None:
+            ncc.all_gather(srcs=[sloc], dsts=[sall], replica_group=group, collective_dim=0)
+        else:
+            cs_ = nl.ndarray((T, CQ + CK), dtype=nl.bfloat16, buffer=nl.sbuf)
+            nisa.dma_copy(dst=cs_[0:T, 0:CQ + CK], src=sloc.ap(pattern=[[CQ + CK, T], [1, CQ + CK]], offset=0))
+            nisa.dma_copy(dst=sall.ap(pattern=[[CQ + CK, T], [1, CQ + CK]], offset=0), src=cs_[0:T, 0:CQ + CK])
+        nisa.core_barrier(sall, (0, 1))
+        # the latents in column order: q_lat[t, CQ r + j] = sall[r, t, j], kv[t, CK r + j] = sall[r, t, CQ + j]
+        pr = nl.ndarray((T, PJ), dtype=nl.bfloat16, buffer=nl.sbuf)
+        nisa.dma_copy(dst=pr.ap(pattern=[[PJ, T], [CQ, nr], [1, CQ]], offset=0),
+                      src=sall.ap(pattern=[[CQ + CK, T], [T * (CQ + CK), nr], [1, CQ]], offset=0))
+        nisa.dma_copy(dst=pr.ap(pattern=[[PJ, T], [CK, nr], [1, CK]], offset=QL),
+                      src=sall.ap(pattern=[[CQ + CK, T], [T * (CQ + CK), nr], [1, CK]], offset=CQ))
+        if gate is not None:
+            nisa.tensor_copy(dst=pr[0:T, QL + NKV:PJ], src=sb[0:T, CQ + CK:CS])
+    else:
+        # ---- the projections ---------------------------------------------------------------------------------------------
+        ps = [nl.ndarray((P, W), dtype=nl.float32, buffer=nl.psum) for _ in range(NC)]
+        for kb in range(KH):
+            if kb % KB_DMA == 0 and kb not in bufs:
+                bufs[kb] = load(kb)
+            b = bufs[kb - kb % KB_DMA]
+            for c, (w, c0, width, _) in enumerate(chunks):
+                nisa.nc_matmul(dst=ps[c][c * TILE:c * TILE + T, 0:width], stationary=xs[0:P, kb, 0:T],
+                               moving=b[c][0:P, kb % KB_DMA, 0:width], tile_position=(0, c * TILE),
+                               tile_size=(P, TILE), accumulate=None)
+        for c, (w, c0, width, o0) in enumerate(chunks):
+            ob = nl.ndarray((P, W), dtype=nl.bfloat16, buffer=nl.sbuf)
+            nisa.tensor_copy(dst=ob[c * TILE:c * TILE + T, 0:width], src=ps[c][c * TILE:c * TILE + T, 0:width])
+            nisa.dma_copy(dst=pj.ap(pattern=[[PJ, T], [1, width]], offset=o0),
+                          src=ob[c * TILE:c * TILE + T, 0:width], dge_mode=nisa.dge_mode.hwdge, engine=DMA_ENGINES[c % 2])
+        nisa.core_barrier(pj, (0, 1))
+        pr = nl.ndarray((T, PJ), dtype=nl.bfloat16, buffer=nl.sbuf)
+        nisa.dma_copy(dst=pr[0:T, 0:PJ], src=pj.ap(pattern=[[PJ, T], [1, PJ]], offset=0))
     if gate is not None and pid == 0:
         gs_ = nl.ndarray((T, NG_), dtype=nl.bfloat16, buffer=nl.sbuf)
         nisa.activation(dst=gs_[0:T, 0:NG_], op=nl.sigmoid, data=pr[0:T, QL + NKV:PJ])
@@ -276,3 +331,16 @@ def attn_in_decode(x, ln_w, q_a, qa_ln_w, q_b, w_uk, kv_a, kva_ln_w, cos, sin, c
     if gate is not None:
         return query, compact, q_lat, cache, gate_x
     return query, compact, q_lat, cache
+
+
+def qkv_shard_layout(q_a, kv_a, gate, rank: int, ranks: int):
+    """attn_in_decode's ``qkv_sh`` for ``rank`` of ``ranks``: [128, H / 128, CQ + CK + V] bf16 from q_a [H, QL], kv_a
+    [H, NKV] (replicated) and this rank's gate [H, V]: its CQ = QL / ranks q_a columns, CK = NKV / ranks kv_a columns
+    and the gate, partition-major (pack[p, kb, :] = row 128 kb + p)."""
+    import torch
+
+    H, QL = q_a.shape
+    NKV = kv_a.shape[1]
+    cq, ck = QL // ranks, NKV // ranks
+    w = torch.cat([q_a[:, rank * cq:(rank + 1) * cq], kv_a[:, rank * ck:(rank + 1) * ck], gate], dim=1)
+    return w.reshape(H // P, P, -1).permute(1, 0, 2).contiguous()
