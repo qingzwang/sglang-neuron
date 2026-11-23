@@ -42,6 +42,7 @@ class Hy4KVStore:
                        for _ in range(config.num_hidden_layers)]
         self.index = [torch.zeros(self.rows, config.index_head_dim, dtype=DTYPE, device=device)
                       for _ in config.full_layers]
+        self.index_layers = tuple(config.full_layers)
         logger.info("Hy4 KV store: %d pages of %d tokens (%d a rank), %d local rows, %.2f GiB a rank", self.pages,
                     page, self.block, self.rows, self.bytes() / 2**30)
 
@@ -60,10 +61,33 @@ def accounting_pool_cls():
     from sglang_neuron.mem_cache.memory_pool import NeuronMHATokenToKVPoolKind
 
     class Hy4AccountingPool(NeuronMHATokenToKVPoolKind):
+        hy4_store = None  # the graphs' KV store (configure_kv_cache), whose regions a PD transfer moves
+
         def _create_buffers(self) -> None:
             k_shape, shape = self.get_kv_buffer_shape()
             self.k_buffer = [torch.zeros((1, *k_shape[1:]), dtype=self.store_dtype, device="cpu")]
             self.v_buffer = [torch.zeros((1, *shape[1:]), dtype=self.store_dtype, device="cpu")]
+
+        def get_contiguous_buf_infos(self):
+            """(ptrs, lens, item_lens) of the store's regions for a PD transfer: every layer's MLA rows, then every
+            full layer's index keys. Page p's rows on this rank are its local rows [p block, (p + 1) block), one run
+            at ptr + p item_len, so a prefill rank's pages land in the same rank's rows of an equal-TP decode (the
+            context-parallel split is the same on both sides)."""
+            from sglang_neuron.backend.device_io import device_address
+
+            store = self.hy4_store
+            if store is None:
+                raise RuntimeError("Hy4's PD transfer needs the KV store bound to the accounting pool")
+            regions = store.latent + store.index
+            ptrs = [device_address(t) for t in regions]
+            lens = [t.numel() * t.element_size() for t in regions]
+            return ptrs, lens, [store.block * t.shape[1] * t.element_size() for t in regions]
+
+        def get_kv_layer_ids(self):
+            """The model layer of each region get_contiguous_buf_infos lists (both PD peers pair the entries by
+            them): every layer's MLA rows, then each full layer's index keys."""
+            store = self.hy4_store
+            return list(range(len(store.latent))) + list(store.index_layers)
 
     return Hy4AccountingPool
 
@@ -93,6 +117,7 @@ def configure_kv_cache(configurator, config: Hy4Config, *, tp: int, device):
     allocator = current_platform.get_paged_allocator_cls()(
         tokens, page_size=page, dtype=torch.bfloat16, device=configurator.device, kvcache=pool, need_sort=True)
     store = Hy4KVStore(config, tp=tp, page=page, tokens=tokens, device=device)
+    pool.hy4_store = store
     result = KVCacheConfigResult(
         max_total_num_tokens=tokens, max_running_requests=running, full_max_total_num_tokens=None,
         swa_max_total_num_tokens=None, req_to_token_pool=req_pool, token_to_kv_pool=pool,

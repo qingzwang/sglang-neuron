@@ -1,0 +1,13 @@
+=== decode [Success]
+[2026-11-23 12:28:11 TP0 EP0] Hy4 DFly worker: Q = 7 rows a request
+[2026-11-23 12:28:11 TP0 EP0] Hy4 DFly: decode row buckets [7, 28] (7 rows a request)
+[2026-11-23 12:28:11 TP0 EP0] Hy4 staged runtime (decode): prologue of 2 layers, 19 groups of 4, epilogue, DFly draft
+[2026-11-23 12:30:15 TP0 EP0] Decode batch, #running-req: 1, #token: 1024, token usage: 0.00, accept len: 2.00, accept rate: 0.17, pre-allocated usage: 0.00, #prealloc-req: 0, #transfer-req: 0, #retracted-req: 0, cpu gra
+[2026-11-23 12:30:17 TP0 EP0] Hy4 DFly: 64 steps, mean accepted drafts 1.36 a request-step (accept length 2.36); last 64 steps 1981.8 ms each; with drafts 1 of 1
+[2026-11-23 12:30:19 TP0 EP0] Decode batch, #running-req: 1, #token: 1024, token usage: 0.00, accept len: 3.73, accept rate: 0.45, pre-allocated usage: 0.00, #prealloc-req: 0, #transfer-req: 0, #retracted-req: 0, cpu gra
+[2026-11-23 12:30:22 TP0 EP0] Decode batch, #running-req: 1, #token: 1024, token usage: 0.00, accept len: 3.10, accept rate: 0.35, pre-allocated usage: 0.00, #prealloc-req: 0, #transfer-req: 0, #retracted-req: 0, cpu gra
+[2026-11-23 12:30:22 TP0 EP0] Hy4 DFly: 128 steps, mean accepted drafts 1.93 a request-step (accept length 2.93); last 64 steps 77.1 ms each; with drafts 1 of 1
+[2026-11-23 12:30:26 TP0 EP0] Decode batch, #running-req: 1, #token: 1024, token usage: 0.00, accept len: 4.62, accept rate: 0.60, pre-allocated usage: 0.00, #prealloc-req: 0, #transfer-req: 0, #retracted-req: 0, cpu gra
+[2026-11-23 12:30:28 TP0 EP0] Hy4 DFly: 192 steps, mean accepted drafts 2.23 a request-step (accept length 3.23); last 64 steps 87.7 ms each; with drafts 1 of 1
+[2026-11-23 12:30:29 TP0 EP0] Decode batch, #running-req: 1, #token: 1024, token usage: 0.00, accept len: 2.50, accept rate: 0.25, pre-allocated usage: 0.00, #prealloc-req: 0, #transfer-req: 0, #retracted-req: 0, cpu gra
+	
