@@ -38,21 +38,32 @@ class Hy4KVStore:
         # SGLang's pages, and its reserved page 0
         self.pages = tokens // page + 1
         self.rows = self.pages * self.block
-        self.latent = [torch.zeros(self.rows, config.compact_dim, dtype=DTYPE, device=device)
-                       for _ in range(config.num_hidden_layers)]
-        self.index = [torch.zeros(self.rows, config.index_head_dim, dtype=DTYPE, device=device)
-                      for _ in config.full_layers]
+        lat_w, idx_w, dt = self.row_layout(config)
+        self.latent = [torch.zeros(self.rows, lat_w, dtype=dt, device=device) for _ in range(config.num_hidden_layers)]
+        self.index = [torch.zeros(self.rows, idx_w, dtype=dt, device=device) for _ in config.full_layers]
         self.index_layers = tuple(config.full_layers)
         logger.info("Hy4 KV store: %d pages of %d tokens (%d a rank), %d local rows, %.2f GiB a rank", self.pages,
                     page, self.block, self.rows, self.bytes() / 2**30)
+
+    @staticmethod
+    def row_layout(config: Hy4Config):
+        """(MLA row width, index key width, dtype): bf16 rows, or with HY4_KV_FP8 uint8 bytes (kernels/kv_fp8.py: the
+        latent's 512 channels FP8 then the RoPE's 64 bf16, 640 bytes; the index key's 128 FP8)."""
+        import os
+
+        if os.environ.get("HY4_KV_FP8", "0") == "1":
+            rope = config.compact_dim - config.kv_lora_rank
+            return config.kv_lora_rank + 2 * rope, config.index_head_dim, torch.uint8
+        return config.compact_dim, config.index_head_dim, DTYPE
 
     def bytes(self) -> int:
         return sum(t.numel() * t.element_size() for t in self.latent + self.index)
 
     @staticmethod
     def bytes_per_token(config: Hy4Config, tp: int) -> float:
-        row = config.num_hidden_layers * config.compact_dim + len(config.full_layers) * config.index_head_dim
-        return row * 2 / tp
+        lat_w, idx_w, dt = Hy4KVStore.row_layout(config)
+        size = torch.empty((), dtype=dt).element_size()
+        return (config.num_hidden_layers * lat_w + len(config.full_layers) * idx_w) * size / tp
 
 
 @functools.lru_cache(maxsize=None)
@@ -126,7 +137,7 @@ def hy4_host_pool_cls():
             if page_size != store.page:
                 raise ValueError(f"HiCache's {page_size}-token page is not Hy4's {store.page}-token KV page")
             views = [t.view(store.pages, store.block, t.shape[1]) for t in store.latent + store.index]
-            super().__init__(views, dtype=DTYPE, page_size=page_size, layer_num=1,
+            super().__init__(views, dtype=views[0].dtype, page_size=page_size, layer_num=1,
                              device_capacity_tokens=kv_pool.size, start_layer=0, end_layer=0,
                              host_to_device_ratio=host_to_device_ratio, host_size=host_size, layout=layout,
                              allocator_type=allocator_type, pool_label=pool_label, device_page_limit=store.pages,

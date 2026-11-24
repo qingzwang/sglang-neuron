@@ -19,13 +19,16 @@ import nki
 import nki.isa as nisa
 import nki.language as nl
 
+from sglang_neuron.models.hy4.kernels.kv_fp8 import unpack_rows
+
 P = 128
 KEY_TILE = 512
 NBUF = 3  # gather buffers in flight
 
 
 def mla_sparse(q, cache, rows, bias, onehot, scale=1.0, tag=""):
-    """q [NB, 128, D] bf16; cache [R, D] bf16 (this layer's cache rows); rows [NB, S] int32 (the block's slots' cache
+    """q [NB, 128, D] bf16; cache [R, D] bf16 (this layer's cache rows; or HY4_KV_FP8's [R, W] uint8 rows, unpacked
+    in SBUF after the gather: kernels/kv_fp8.py); rows [NB, S] int32 (the block's slots' cache
     rows, R for a pad slot); bias [NB, 128 / H, S] bf16; onehot [128 / H, 128] bf16 -> (out [H, T, L] fp32, ml [H, T, 2]
     fp32), with S a multiple of 512, at most 2048, and L = 512."""
     NB, _, D = q.shape
@@ -46,20 +49,28 @@ def mla_sparse(q, cache, rows, bias, onehot, scale=1.0, tag=""):
 
     oh = nl.ndarray((TPB, P), dtype=onehot.dtype, buffer=nl.sbuf)
     nisa.dma_copy(dst=oh[0:TPB, 0:P], src=onehot.ap(pattern=[[P, TPB], [1, P]], offset=0))
+    fp8 = cache.dtype == nl.uint8
+    W = cache.shape[1]  # a row's elements (bytes, FP8)
+    kdt = nl.bfloat16 if fp8 else cache.dtype
     pool = []
     for i in range(NBUF):
-        g = nl.ndarray((P, SC, D), dtype=cache.dtype, buffer=nl.sbuf)
-        nisa.memset(dst=g[0:P, 0:SC, 0:D], value=0.0)
+        g = nl.ndarray((P, SC, W), dtype=cache.dtype, buffer=nl.sbuf)
+        nisa.memset(dst=g[0:P, 0:SC, 0:W], value=0)
         pool.append(g)
+    if fp8:
+        upool = [nl.ndarray((P, SC, D), dtype=nl.bfloat16, buffer=nl.sbuf) for _ in range(2)]
 
     for b in range(pid, NB, n_prg):
-        kg = pool[(b // n_prg) % NBUF]
+        kg = kg8 = pool[(b // n_prg) % NBUF]
         # the block's slots (block_slots' order), read column-major by the gather: kg[p, m] is score column m * 128 + p
         idx = nl.ndarray((P, SC), dtype=nl.int32, buffer=nl.sbuf)
         nisa.dma_copy(dst=idx[0:P, 0:SC], src=rows.ap(pattern=[[1, P], [P, SC]], offset=b * S))
-        nisa.dma_copy(dst=kg[0:P, 0:SC, 0:D], src=cache.ap(pattern=[[D, P * SC], [1, D]], offset=0,
-                                                           vector_offset=idx[0:P, 0:SC], indirect_dim=0),
+        nisa.dma_copy(dst=kg8[0:P, 0:SC, 0:W], src=cache.ap(pattern=[[W, P * SC], [1, W]], offset=0,
+                                                             vector_offset=idx[0:P, 0:SC], indirect_dim=0),
                       dge_mode=nisa.dge_mode.swdge, oob_mode=nisa.oob_mode.skip)
+        if fp8:
+            kg = upool[(b // n_prg) % 2]
+            unpack_rows(kg, kg8, P, SC, L, D - L)
         bs = nl.ndarray((TPB, S), dtype=bias.dtype, buffer=nl.sbuf)
         nisa.dma_copy(dst=bs[0:TPB, 0:S], src=bias.ap(pattern=[[S, TPB], [1, S]], offset=b * TPB * S))
         qs = nl.ndarray((P, D), dtype=q.dtype, buffer=nl.sbuf)
@@ -71,7 +82,7 @@ def mla_sparse(q, cache, rows, bias, onehot, scale=1.0, tag=""):
             nisa.nc_transpose(dst=tp[0:w, 0:P], data=qs[0:P, o:o + w])
             nisa.tensor_copy(dst=qT[0:w, c, 0:P], src=tp[0:w, 0:P],
                              engine=nisa.scalar_engine if c % 2 else nisa.vector_engine)
-        kT = nl.ndarray((P, NC, S), dtype=cache.dtype, buffer=nl.sbuf)
+        kT = nl.ndarray((P, NC, S), dtype=kdt, buffer=nl.sbuf)
         for m in range(SC):
             for c, (o, w) in enumerate(chunks):
                 tp = nl.ndarray((P, P), dtype=nl.bfloat16, buffer=nl.psum)

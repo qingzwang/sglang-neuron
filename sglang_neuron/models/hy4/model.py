@@ -235,10 +235,11 @@ class Attention(nn.Module):
         q = (q_lat @ self.q_b).view(t, self.heads, cfg.q_head_dim)
         q_nope, q_pe = q.split([cfg.qk_nope_head_dim, cfg.qk_rope_head_dim], dim=-1)
         q_pe = rotate(q_pe, cos, sin)
-        q_abs = torch.einsum("thd,hdr->thr", q_nope, self.w_uk)
+        q_abs = torch.einsum("thd,hdr->thr", q_nope, self.kv_uk())
         query = torch.cat([q_abs, q_pe], dim=-1)
         latent, k_pe = lat_pe.split([cfg.kv_lora_rank, cfg.qk_rope_head_dim], dim=-1)
-        compact = torch.cat([self.kv_a_layernorm(latent), rotate(k_pe, cos, sin)], dim=-1)
+        lat = self.kv_a_layernorm(latent)
+        compact = torch.cat([lat * KV_FP8_SCALE if _KV_FP8 else lat, rotate(k_pe, cos, sin)], dim=-1)
         # every head's query on every rank: the attention runs over this rank's share of the keys for all heads
         query = self.group.all_gather(query, dim=1)
         return query, compact, q_lat
@@ -253,7 +254,7 @@ class Attention(nn.Module):
         cfg = self.config
         q, compact, q_lat, _ = wrap_nki(attn_in_decode, alias_outputs_in_place=True)[get_logical_nc_config()](
             x_raw.to(DTYPE).contiguous(), ln_w.reshape(1, -1), self.q_a, self.q_a_layernorm.weight.reshape(1, -1),
-            self.q_b, self.w_uk, self.kv_a, self.kv_a_layernorm.weight.reshape(1, -1), cos.contiguous(),
+            self.q_b, self.kv_uk(), self.kv_a, self.kv_ln_w(), cos.contiguous(),
             sin.contiguous(), cache, write_rows.to(torch.int32).reshape(1, -1),
             ranks=(tuple(range(self.group.size)),), eps=float(cfg.rms_norm_eps), lat_eps=float(self.q_a_layernorm.eps),
             qkv_sh=getattr(self, "qkv_sh", None))
@@ -273,15 +274,31 @@ class Attention(nn.Module):
         k = F.layer_norm((x @ self.idx_k).float(), (idim,), self.idx_k_norm_weight, self.idx_k_norm_bias,
                          cfg.rms_norm_eps).to(DTYPE)
         k = torch.cat([k[..., :idim - rope], rotate(k[..., idim - rope:], cos, sin)], dim=-1)
+        if _KV_FP8:
+            # the stored keys x KV_FP8_SCALE, the queries / KV_FP8_SCALE: the same scores
+            k, q = k * KV_FP8_SCALE, q * (1.0 / KV_FP8_SCALE)
         # the reference keeps weights_proj in fp32
         w = (x.float() @ self.idx_w.float()) * (ih ** -0.5) * (idim ** -0.5)
         return q, w, k
+
+    def kv_uk(self):
+        """The absorbed query's w_uk, over the stored latent's scale (HY4_KV_FP8)."""
+        return (self.w_uk * (1.0 / KV_FP8_SCALE)).to(self.w_uk.dtype) if _KV_FP8 else self.w_uk
+
+    def kv_uv(self):
+        """w_uv over the stored latent's scale (HY4_KV_FP8): an attended latent is the stored rows' mix."""
+        return (self.w_uv * (1.0 / KV_FP8_SCALE)).to(self.w_uv.dtype) if _KV_FP8 else self.w_uv
+
+    def kv_ln_w(self):
+        """kv_a_layernorm's weight [1, latent] as the attention input kernel writes the rows (x KV_FP8_SCALE)."""
+        w = self.kv_a_layernorm.weight.reshape(1, -1)
+        return (w * KV_FP8_SCALE).to(w.dtype) if _KV_FP8 else w
 
     def output(self, attended, x):
         """This rank's heads' merged latents [T, heads, latent] through their value up-projection, sigmoid gate and
         o_proj columns; the ranks' partial outputs are all-reduced."""
         t = x.shape[0]
-        values = torch.einsum("thr,hdr->thd", attended.to(DTYPE), self.w_uv).reshape(t, -1)
+        values = torch.einsum("thr,hdr->thd", attended.to(DTYPE), self.kv_uv()).reshape(t, -1)
         gated = values * torch.sigmoid(x @ self.gate)
         return self.group.all_reduce(gated @ self.o)
 
@@ -346,7 +363,59 @@ def _write_slots(slots, page: int, block: int, rank):
 
 
 def _write(cache, rows, values):
+    if cache.dtype == torch.uint8:
+        return _write_fp8(cache, rows, values)
     cache[rows] = values.to(cache.dtype)
+
+
+def _fp8_split(cache):
+    """(the FP8 channels, the bf16 channels) of an FP8 store row of cache.shape[1] bytes: the MLA rows' 640 (512 + 64),
+    the index keys' 128."""
+    w = cache.shape[1]
+    return (w, 0) if w == 128 else (512, (w - 512) // 2)
+
+
+def _write_fp8(cache, rows, values):
+    """values [N, n8 + nb] into the FP8 store's rows (kernels/kv_fp8.kv_pack_write, in place); FP8 channels
+    clamped to e4m3's range."""
+    from sglang_neuron.backend.stack import wrap_nki
+    from sglang_neuron.models.hy4.kernels.kv_fp8 import kv_pack_write
+    from sglang_neuron.utils.hardware_config import get_logical_nc_config
+
+    n8, nb = _fp8_split(cache)
+    rows = rows.reshape(-1).to(torch.int32)
+    values = values.reshape(rows.shape[0], -1).to(DTYPE)
+    if nb:
+        values = torch.cat([values[:, :n8].clamp(-224.0, 224.0), values[:, n8:]], 1)
+    else:
+        values = values.clamp(-224.0, 224.0)
+    pad = -rows.shape[0] % 128
+    if pad:
+        rows = torch.cat([rows, rows.new_full((pad,), cache.shape[0])])
+        values = torch.cat([values, values.new_zeros((pad, values.shape[1]))])
+    wrap_nki(kv_pack_write, alias_outputs_in_place=True)[get_logical_nc_config()](cache, rows, values.contiguous(),
+                                                                                  n8=n8)
+
+
+def _keys(cache, rows):
+    """cache[rows]: the store's rows bf16 [*rows.shape, row] (an FP8 store's unpacked, kernels/kv_fp8.py)."""
+    if cache.dtype != torch.uint8:
+        return cache[rows]
+    from sglang_neuron.backend.stack import wrap_nki
+    from sglang_neuron.models.hy4.kernels.kv_fp8 import gather_order, kv_unpack_gather
+    from sglang_neuron.utils.hardware_config import get_logical_nc_config
+
+    n8, nb = _fp8_split(cache)
+    flat = rows.reshape(-1).to(torch.int32)
+    n = flat.shape[0]
+    pad = -n % 128
+    if pad:
+        flat = torch.cat([flat, flat.new_full((pad,), cache.shape[0])])
+    step = 8192  # rows a gather: its descriptors (one a row; 32K in one DMA hangs the queue) and SBUF
+    k = wrap_nki(kv_unpack_gather)[get_logical_nc_config()]
+    parts = [k(cache, gather_order(flat[i:i + step]), n8=n8) for i in range(0, flat.shape[0], step)]
+    out = torch.cat(parts) if len(parts) > 1 else parts[0]
+    return out[:n].reshape(*rows.shape, n8 + nb)
 
 
 # the prefill's NKI attention and indexer kernels (kernels/); HY4_NKI=0 runs their XLA forms
@@ -390,6 +459,13 @@ def _nki_attend_ok(query, rows) -> bool:
 _NKI_HC = _NKI and os.environ.get("HY4_NKI_HC", "1") != "0"
 _NKI_SPARSE = _NKI and os.environ.get("HY4_NKI_SPARSE", "1") != "0"
 # a multi-row decode's (DFly verify) attention through the sparse prefill kernel
+# HY4_KV_FP8=1: the KV store's rows in FP8 (kernels/kv_fp8.py): the MLA rows' 512 latent channels and the index keys
+# trn2 e4m3 (the RoPE channels bf16), 640 bytes and 128 bytes a row for 1152 and 256. Stored values are KV_FP8_SCALE x
+# the true ones (a power of two: exact in bf16): the norms bound a latent channel by sqrt(512) |w| <= 28 (the
+# checkpoint's kv_a_layernorm weights are at most 1.24) and an index key by ~21, so x 8 stays under e4m3's 240; the
+# query and value sides divide it back out (Attention.kv_uk / kv_uv, the index query)
+_KV_FP8 = os.environ.get("HY4_KV_FP8", "0") == "1"
+KV_FP8_SCALE = 8.0
 # the prefill attention's merge (merge_head_major) reduce-scatters bf16 partials, not fp32
 _MERGE_BF16 = os.environ.get("HY4_MERGE_BF16", "0") == "1"
 _NKI_SPARSE_DECODE = _NKI_SPARSE and os.environ.get("HY4_NKI_SPARSE_DECODE", "0") == "1"  # off: no faster in the served graph (70.0 vs 70.2 ms a 7-row verify)
@@ -1001,9 +1077,9 @@ class Hy4Graph(nn.Module):
             streams.reshape(t, -1), pending[0].to(DTYPE), pending[1], layer.attn_hc.fn, layer.attn_hc.affine(), layer.mlp_hc.fn,
             layer.mlp_hc.affine(), ones, place,
             layer.input_layernorm.weight.reshape(1, -1), attn.q_a, attn.q_a_layernorm.weight.reshape(1, -1), attn.q_b,
-            attn.w_uk, attn.kv_a, attn.kv_a_layernorm.weight.reshape(1, -1), attn.gate, cos.contiguous(),
+            attn.kv_uk(), attn.kv_a, attn.kv_ln_w(), attn.gate, cos.contiguous(),
             sin.contiguous(), cache, write_rows.to(torch.int32).reshape(1, -1), slots, bias,
-            onehot_rows(cfg.num_attention_heads, streams.device), attn.sinks.reshape(1, -1), attn.w_uv[0], attn.o,
+            onehot_rows(cfg.num_attention_heads, streams.device), attn.sinks.reshape(1, -1), attn.kv_uv()[0], attn.o,
             layer.post_attention_layernorm.weight.reshape(1, -1), moe.router_pm, moe.router_bias.reshape(1, -1),
             *moe.sublayer_experts(rank), moe.sh_gate_up_pm, moe.shared.down,
             ranks=(tuple(range(self.group.size)),), eps=float(cfg.rms_norm_eps), hc_eps=float(cfg.hc_eps),
@@ -1045,12 +1121,12 @@ class Hy4Graph(nn.Module):
             for b in range(t // q):  # each request's rows (dfly_worker repeats its table over them)
                 qb = torch.cat([iq[b * q:(b + 1) * q], iq.new_zeros(tp - q, ih, idim)]).reshape(tp * ih, idim)
                 wb = torch.cat([iw[b * q:(b + 1) * q], iw.new_zeros(tp - q, ih)]).to(torch.float32).reshape(-1, 128)
-                keys = cache[key_rows[b * q]]  # [K, idim]
+                keys = _keys(cache, key_rows[b * q])  # [K, idim]
                 parts.append(wrap_nki(index_scores_decode)[get_logical_nc_config()](
                     qb.t().contiguous(), keys, wb, mask)[:q])
             scores = torch.cat(parts) if len(parts) > 1 else parts[0]
         elif self.phase == "decode":
-            keys = cache[key_rows].float()  # [B, keys, idim]
+            keys = _keys(cache, key_rows).float()  # [B, keys, idim]
             s = torch.einsum("bhd,bkd->bhk", iq.float(), keys).relu()
             # the head weighting as a multiply and a sum over the heads: as an einsum it lowers to a batched matmul of
             # one column per row, which the compiler feeds through layout DMAs (most of a full layer's prefill time)
@@ -1061,7 +1137,7 @@ class Hy4Graph(nn.Module):
             from sglang_neuron.models.hy4.kernels.index_scores import index_scores, placement_mask
             from sglang_neuron.utils.hardware_config import get_logical_nc_config
 
-            keys = cache[key_rows[0]]  # [K, idim]
+            keys = _keys(cache, key_rows[0])  # [K, idim]
             t, ih, idim = iq.shape
             scores = wrap_nki(index_scores)[get_logical_nc_config()](
                 iq.reshape(t * ih, idim).t().contiguous(), keys.t().contiguous(), iw.reshape(-1, 128),
@@ -1070,7 +1146,7 @@ class Hy4Graph(nn.Module):
             rows = key_rows[0]
             parts = []
             for start in range(0, rows.shape[0], KEY_TILE):
-                keys = cache[rows[start:start + KEY_TILE]].float()
+                keys = _keys(cache, rows[start:start + KEY_TILE]).float()
                 s = torch.einsum("thd,kd->thk", iq.float(), keys).relu()
                 parts.append((s * iw[:, :, None]).sum(1))
             scores = torch.cat(parts, dim=1)
@@ -1120,7 +1196,7 @@ class Hy4Graph(nn.Module):
         gate_x = torch.sigmoid(x @ attn.gate)
         return wrap_nki(attn_core_decode)[get_logical_nc_config()](
             query.to(DTYPE).reshape(-1, 128, d), cache, slots, bias, onehot_rows(h, query.device),
-            attn.sinks.reshape(1, -1), attn.w_uv[0], gate_x, attn.o, ranks=(tuple(range(self.group.size)),),
+            attn.sinks.reshape(1, -1), attn.kv_uv()[0], gate_x, attn.o, ranks=(tuple(range(self.group.size)),),
             scale=float(self.config.softmax_scale), t_real=t)
 
     def _attend_sparse(self, attn, cache, query, rows, keep):
@@ -1162,7 +1238,7 @@ class Hy4Graph(nn.Module):
         ms, ls, outs = [], [], []
         tile = rows.shape[0] if self.phase == "decode" else QUERY_TILE
         for start in range(0, rows.shape[0], tile):
-            keys = cache[rows[start:start + tile]]  # [r, cap, compact]
+            keys = _keys(cache, rows[start:start + tile])  # [r, cap, compact]
             q = query[start:start + tile]
             s = torch.einsum("rhd,rkd->rhk", q, keys).float() * scale
             s = torch.where(keep[start:start + tile, None, :], s, torch.full_like(s, MASKED))
@@ -1181,7 +1257,7 @@ class Hy4Graph(nn.Module):
         scale = cfg.softmax_scale
         latent = cfg.kv_lora_rank
         if self.phase == "decode":
-            keys = cache[key_rows]  # [B, keys, compact]
+            keys = _keys(cache, key_rows)  # [B, keys, compact]
             s = torch.einsum("bhd,bkd->bhk", query, keys).float() * scale
             s = torch.where(selected[:, None, :], s, torch.full_like(s, MASKED))
             m = s.amax(-1)
@@ -1197,7 +1273,7 @@ class Hy4Graph(nn.Module):
             from sglang_neuron.models.hy4.kernels.mla_dense import UNROLL, mla_dense, onehot_rows
             from sglang_neuron.utils.hardware_config import get_logical_nc_config
 
-            keys = cache[rows]  # [K, compact]
+            keys = _keys(cache, rows)  # [K, compact]
             k, d = keys.shape
             out, ml = wrap_nki(mla_dense)[get_logical_nc_config()](
                 query.to(DTYPE).reshape(-1, UNROLL, 128, d), keys, keys.t().contiguous(),
@@ -1207,7 +1283,7 @@ class Hy4Graph(nn.Module):
         l = torch.zeros((t, h), dtype=torch.float32, device=query.device)
         out = torch.zeros((t, h, latent), dtype=torch.float32, device=query.device)
         for start in range(0, rows.shape[0], KEY_TILE):
-            keys = cache[rows[start:start + KEY_TILE]]  # [K, compact]
+            keys = _keys(cache, rows[start:start + KEY_TILE])  # [K, compact]
             s = torch.einsum("thd,kd->thk", query, keys).float() * scale
             s = s + selected[:, None, start:start + KEY_TILE]
             m_new = torch.maximum(m, s.amax(-1))

@@ -20,6 +20,8 @@ import nki.isa as nisa
 import nki.language as nl
 from nki.collectives import ReplicaGroup
 
+from sglang_neuron.models.hy4.kernels.kv_fp8 import pack_rows
+
 P = 128
 TILE = 32
 W = 512
@@ -259,12 +261,23 @@ def attn_in_decode(x, ln_w, q_a, qa_ln_w, q_b, w_uk, kv_a, kva_ln_w, cos, sin, c
     nisa.tensor_copy(dst=cp[0:T, 0:L], src=cl[0:T, 0:L])
     nisa.tensor_copy(dst=cp[0:T, L:L + RP], src=ck[0:T, 0:RP])
     # the cache rows now, ahead of the query's work: the attention's key gather waits on them
+    CW = cache.shape[1]
+    c8 = None
+    if cache.dtype == nl.uint8:
+        # HY4_KV_FP8 (kernels/kv_fp8.py): the latent (pre-scaled by the caller's kva_ln_w) clamped to e4m3's range
+        # and packed with the bf16 RoPE channels
+        cq = nl.ndarray((T, 1, NKV), dtype=nl.bfloat16, buffer=nl.sbuf)
+        nisa.tensor_scalar(dst=cq[0:T, 0, 0:L], data=cp[0:T, 0:L], op0=nl.minimum, operand0=224.0, op1=nl.maximum,
+                           operand1=-224.0)
+        nisa.tensor_copy(dst=cq[0:T, 0, L:NKV], src=cp[0:T, L:NKV])
+        c8 = nl.ndarray((T, 1, CW), dtype=nl.uint8, buffer=nl.sbuf)
+        pack_rows(c8, cq, T, 1, L, NKV - L)
     if pid == 0:
         for t in range(T):
             r = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.sbuf)
             nisa.dma_copy(dst=r[0:1, 0:1], src=write_rows.ap(pattern=[[T, 1], [1, 1]], offset=t))
-            nisa.dma_copy(dst=cache.ap(pattern=[[NKV, 1], [1, NKV]], offset=0, scalar_offset=r, indirect_dim=0),
-                          src=cp[t:t + 1, 0:NKV])
+            nisa.dma_copy(dst=cache.ap(pattern=[[CW, 1], [1, CW]], offset=0, scalar_offset=r, indirect_dim=0),
+                          src=cp[t:t + 1, 0:CW] if c8 is None else c8[t:t + 1, 0, 0:CW])
     # q = q_lat @ q_b: q_lat transposed as the stationary
     KQ = QL // P
     qlp = nl.ndarray((P, KQ, TA), dtype=nl.bfloat16, buffer=nl.psum)
