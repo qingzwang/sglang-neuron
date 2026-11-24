@@ -486,6 +486,16 @@ def _nki_hc_ok(streams) -> bool:
     return _NKI_HC and streams.device.type != "cpu" and streams.dim() == 3 and streams.shape[0] % 256 == 0
 
 
+# HY4_TOPK_SELECT=1: the decode's selection on the GpSimd top-k (Hy4Graph._topk_state) instead of topk_mask's bins
+# and decode_compact
+_TOPK_SELECT = os.environ.get("HY4_TOPK_SELECT", "0") == "1"
+
+
+def _topk_select_ok(phase, key_rows, x) -> bool:
+    return (_TOPK_SELECT and phase == "decode" and x.device.type != "cpu" and key_rows.shape[-1] % 16 == 0
+            and key_rows.shape[-1] <= 32768 and key_rows.shape[-1] > 2048 // 64)
+
+
 def _nki_index_ok(iq, key_rows) -> bool:
     """Whether the prefill indexer scores run as kernels/index_scores.py."""
     t, ih, idim = iq.shape
@@ -1005,13 +1015,20 @@ class Hy4Graph(nn.Module):
             iq, iw, ik = attn.index_project(x, q_lat, cos, sin, decode=self.phase == "decode")
             _write(index_cache, write_rows, ik)
             # (not in the prologue's layer 0: its program got slower with it, 6.3 -> ~10 ms at 512K)
-            selected, scores = self._select(index_cache, iq, iw, key_rows, valid, kernel_ok=attn.layer_idx > 0)
+            if _topk_select_ok(self.phase, key_rows, x):
+                # each row's top keys on the GpSimd top-k (kernels/select_topk.py): no bins, no compaction
+                scores = self._select(index_cache, iq, iw, key_rows, valid, kernel_ok=attn.layer_idx > 0,
+                                      scores_only=True)
+                state = self._topk_state(scores, valid, key_rows)
+            else:
+                selected, scores = self._select(index_cache, iq, iw, key_rows, valid, kernel_ok=attn.layer_idx > 0)
             # the dense prefill's mask crosses program boundaries (runtime.py) as uint8: a boolean program output of
             # this shape hits a neuronx-cc internal error (NCC_ILSA902)
             # the dense prefill carries the selection as an additive score bias (arithmetic only: selects over the
             # mask, in and across programs, hit a neuronx-cc internal error, NCC_ILSA902)
-            state = self._compact(selected, scores, key_rows) if self._sparse(key_rows) else (
-                (selected.to(torch.float32) - 1.0) * -MASKED,)
+            if state is None or not _topk_select_ok(self.phase, key_rows, x):
+                state = self._compact(selected, scores, key_rows) if self._sparse(key_rows) else (
+                    (selected.to(torch.float32) - 1.0) * -MASKED,)
         if (_NKI_ATTN_CORE and self.phase == "decode" and self._sparse(key_rows) and x.shape[0] <= 8
                 and x.device.type != "cpu" and not _ABLATE and attn.heads == 1):
             # the attention, its merge and the output projection with their three collectives in one kernel
@@ -1104,8 +1121,9 @@ class Hy4Graph(nn.Module):
             return False
         return self.phase == "decode" or key_rows.shape[-1] > PREFILL_DENSE_KEYS
 
-    def _select(self, cache, iq, iw, key_rows, valid, kernel_ok: bool = True):
-        """The selection mask [T, keys] of a full layer over this rank's keys, and their scores."""
+    def _select(self, cache, iq, iw, key_rows, valid, kernel_ok: bool = True, scores_only: bool = False):
+        """The selection mask [T, keys] of a full layer over this rank's keys, and their scores (``scores_only``: the
+        scores alone)."""
         cfg = self.config
         q = self.dfly.dfly.block if self.dfly is not None else 0
         if (kernel_ok and self.phase == "decode" and _NKI_INDEX_DECODE and q and iq.shape[0] % q == 0 and iq.device.type != "cpu"
@@ -1150,10 +1168,36 @@ class Hy4Graph(nn.Module):
                 s = torch.einsum("thd,kd->thk", iq.float(), keys).relu()
                 parts.append((s * iw[:, :, None]).sum(1))
             scores = torch.cat(parts, dim=1)
+        if scores_only:
+            return scores
         if self.phase == "decode":
             # a decode step's collectives are latency bound: the same resolution in two rounds of wider bins
             return topk_mask(scores, valid, cfg.index_topk, self.group, DECODE_SELECT_BINS, DECODE_SELECT_ROUNDS), scores
         return topk_mask(scores, valid, cfg.index_topk, self.group), scores
+
+    def _topk_state(self, scores, valid, key_rows):
+        """(rows [R, cap], keep [R, cap]) of each row's keys among the index_topk highest over every rank: this rank's
+        cap highest (kernels/select_topk.topk_rows), every rank's gathered, the global index_topk-th of those the
+        threshold (exact but where a rank holds more than cap of a row's winners: the attention keeps cap a rank
+        anyway)."""
+        from sglang_neuron.backend.stack import wrap_nki
+        from sglang_neuron.models.hy4.kernels.select_topk import topk_rows
+        from sglang_neuron.utils.hardware_config import get_logical_nc_config
+
+        cfg = self.config
+        cap = min(self.sparse_cap, scores.shape[-1])
+        low = -1.0e30
+        s = torch.where(valid, scores, torch.full_like(scores, low)).to(DTYPE)
+        k = wrap_nki(topk_rows)[get_logical_nc_config()]
+        vals, idx = k(s.contiguous(), k=cap)  # [R, cap]
+        everyone = self.group.all_gather(vals[None], dim=0)  # [ranks, R, cap]
+        allv = everyone.permute(1, 0, 2).reshape(vals.shape[0], -1).contiguous()
+        kk = min(cfg.index_topk, allv.shape[-1])
+        top, _ = k(allv, k=kk)
+        thr = top.amin(-1, keepdim=True)
+        keep = (vals >= thr) & (vals > low / 2)
+        rows = key_rows.gather(1, idx.to(torch.int64).clamp(min=0, max=key_rows.shape[-1] - 1))
+        return rows, keep
 
     def _compact(self, selected, scores, key_rows):
         """(the local rows [R, cap] of each row's highest-scoring selected keys on this rank, whether each is one
