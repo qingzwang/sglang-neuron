@@ -313,6 +313,9 @@ class Attention(nn.Module):
         w = torch.exp(m - big_m)
         total = self.group.all_reduce(w * l) + torch.exp(sinks - big_m)
         scaled = out * (w / total)[..., None]
+        if _MERGE_BF16:
+            # the reduce-scatter's partials in bf16: half its bytes and the scaling's output
+            scaled = scaled.to(DTYPE)
         h, t, r = scaled.shape
         mine = self.group.reduce_scatter(scaled.reshape(h, t * r), dim=0)
         return mine.view(self.heads, t, r).transpose(0, 1)
@@ -387,6 +390,8 @@ def _nki_attend_ok(query, rows) -> bool:
 _NKI_HC = _NKI and os.environ.get("HY4_NKI_HC", "1") != "0"
 _NKI_SPARSE = _NKI and os.environ.get("HY4_NKI_SPARSE", "1") != "0"
 # a multi-row decode's (DFly verify) attention through the sparse prefill kernel
+# the prefill attention's merge (merge_head_major) reduce-scatters bf16 partials, not fp32
+_MERGE_BF16 = os.environ.get("HY4_MERGE_BF16", "0") == "1"
 _NKI_SPARSE_DECODE = _NKI_SPARSE and os.environ.get("HY4_NKI_SPARSE_DECODE", "0") == "1"  # off: no faster in the served graph (70.0 vs 70.2 ms a 7-row verify)
 
 

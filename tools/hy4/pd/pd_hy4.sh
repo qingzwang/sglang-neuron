@@ -9,7 +9,7 @@ export SGLANG_DISAGGREGATION_NIXL_BACKEND=LIBFABRIC NEURON_RT_VISIBLE_CORES=0-63
 # KVPoll.WaitingForInput"); an aggregated server just queues it
 export SGLANG_DISAGGREGATION_WAITING_TIMEOUT=${PD_WAIT_TIMEOUT:-3600} SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=${PD_WAIT_TIMEOUT:-3600}
 export HY4_NKI_MOE_SUB=1 HY4_HC_CHAIN=1 HY4_NKI_ATTN_IN=1 HY4_MOE_TP=16 HY4_NKI_ATTN_CORE=1 HY4_NKI_LAYER=1 \
-  HY4_QKV_SH=1 HY4_NKI_INDEX_DECODE=1 HY4_IDXQ_SH=1 HY4_NKI_SPARSE_DECODE=1 ${HY4_EXTRA:-}
+  HY4_QKV_SH=1 HY4_NKI_INDEX_DECODE=1 HY4_IDXQ_SH=1 HY4_NKI_SPARSE_DECODE=1 HY4_MERGE_BF16=1 ${HY4_EXTRA:-}
 C=/mnt/nvme/work/hy4/cache_pd_$1_$(cat /mnt/nvme/sglang-neuron/sglang_neuron/models/hy4/kernels/*.py | md5sum | cut -c1-8)
 export TORCH_NEURONX_NEFF_CACHE_DIR=$C/neff TORCH_NEURONX_HLO_CACHE_DIR=$C/hlo NKI_COMPILE_CACHE_URL=$C/nki
 # no Hy4 NKI kernel changed between launches of this cache (its directory is keyed by their md5): restamp it for edits
@@ -24,6 +24,10 @@ COMMON=(--model-path $M --tp-size 64 --ep-size 64 --page-size 1024 --context-len
 [ "${PD_BACKEND:-nixl}" = mooncake ] && export LD_LIBRARY_PATH=/opt/aws/neuron/lib:/opt/amazon/efa/lib:${LD_LIBRARY_PATH:-}
 # AGENTX=1: the AgentX launch's serving flags (served name, metrics, cache report; the decode samples top-k / top-p)
 [ -n "$AGENTX" ] && COMMON+=(--served-model-name tencent/Hy4-FP8 --enable-metrics --enable-cache-report)
+# HICACHE=1: the prefill's KV also in HiCache's host tier (models/hy4/kv.py Hy4HostPool): a session's prefix evicted
+# from the store reloads from host memory instead of a recompute (the decode needs SGLANG_NEURON_HY4_HICACHE=1 too)
+[ -n "$HICACHE" ] && COMMON+=(--enable-hierarchical-cache --hicache-ratio ${HICACHE_RATIO:-4} --hicache-write-policy write_through) \
+  && export SGLANG_NEURON_HY4_HICACHE=1
 # the device sampler, the same on both roles (the prefill samples each request's first token)
 export SGLANG_NEURON_SAMPLER=${SAMPLER:-$([ -n "$AGENTX" ] && echo topk_topp || echo greedy)}
 case $1 in
