@@ -28,20 +28,83 @@ def moe_prefill_tp(x, tok, tok_out, aff, bexp, nit, gate_up, gate_up_scale, down
     """x [T, H] bf16; tok / tok_out / aff / bexp: moe_prefill.moe_blocks over the group's EL experts; nit [1, 1]
     int32: ceil(blocks / 2); gate_up [EL, 128, H / 128, 256] fp8; gate_up_scale [EL, H / 128, 2]; down [EL, 128, H]
     fp8; down_scale [EL, H / 128] -> out [2 T, H] fp32 (the two programs' halves)."""
+    out = _out(x)
+    nb = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.sbuf)
+    nisa.dma_copy(dst=nb[0:1, 0:1], src=nit.ap(pattern=[[1, 1], [1, 1]], offset=0))
+    _blocks(out, x, tok, tok_out, aff, bexp, nb, gate_up, gate_up_scale, down, down_scale, limit)
+    return out
+
+
+def moe_decode_tp(x, aff, bexp, gate_up, gate_up_scale, down, down_scale, limit=10.0):
+    """moe_prefill_tp for a decode batch of T = 128 rows (padded), its block list built on chip: one block an expert,
+    its routed rows by the GpSimd engine's nonzero_with_count (eight experts an instruction), so no XLA sort or
+    compaction (moe_blocks' ops cost more than the experts for a multi-request verify). x [128, H] bf16; aff [128, EL]
+    fp32 (0 off a row's experts); bexp [EL, 1] int32 (0 .. EL - 1) -> out [2 T, H] fp32."""
+    T, H = x.shape
+    EL = aff.shape[1]
+    assert T == P and EL % 16 == 0, f"moe_decode_tp: {T} rows (128), {EL} experts"
+    pid = nl.program_id(axis=0)
+    tok = nl.ndarray((EL, P), dtype=nl.int32, buffer=nl.shared_hbm, name="moe_dec_tok")
+    tok_out = nl.ndarray((EL, 2, P), dtype=nl.int32, buffer=nl.shared_hbm, name="moe_dec_tok_out")
+    a = nl.ndarray((EL, P), dtype=nl.float32, buffer=nl.shared_hbm, name="moe_dec_aff")
+    G = 16
+    for g in range(EL // (P // G)):
+        e0 = g * (P // G)
+        sv = nl.ndarray((P, T + 1), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.memset(dst=sv[0:P, 0:T + 1], value=0.0)
+        for j in range(P // G):
+            # expert e0 + j's column of aff on partition 16 j (each GpSimd core reads its 0th partition)
+            nisa.dma_copy(dst=sv[j * G:j * G + 1, 0:T], src=aff.ap(pattern=[[0, 1], [EL, T]], offset=e0 + j))
+        nz = nl.ndarray((P, T + 1), dtype=nl.int32, buffer=nl.sbuf)
+        nisa.nonzero_with_count(dst=nz[0:P, 0:T + 1], src=sv[0:P, 0:T], index_offset=0, padding_val=T)
+        ix = nl.ndarray((P, T), dtype=nl.uint32, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=ix[0:P, 0:T], src=nz[0:P, 0:T], engine=nisa.gpsimd_engine)
+        ag = nl.ndarray((P, T), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.nc_n_gather(dst=ag[0:P, 0:T], data=sv[0:P, 0:T + 1], indices=ix[0:P, 0:T])  # pad T -> sv[T] = 0
+        # tok_out: the first half's pad 2 T (out of bounds), the second's tok + T (pad T + T = 2 T)
+        pad = nl.ndarray((P, T), dtype=nl.int32, buffer=nl.sbuf)
+        nisa.tensor_scalar(dst=pad[0:P, 0:T], data=nz[0:P, 0:T], op0=nl.greater_equal, operand0=T, op1=nl.multiply,
+                           operand1=T)
+        o0 = nl.ndarray((P, T), dtype=nl.int32, buffer=nl.sbuf)
+        nisa.tensor_tensor(dst=o0[0:P, 0:T], data1=nz[0:P, 0:T], data2=pad[0:P, 0:T], op=nl.add)
+        o1 = nl.ndarray((P, T), dtype=nl.int32, buffer=nl.sbuf)
+        nisa.tensor_scalar(dst=o1[0:P, 0:T], data=nz[0:P, 0:T], op0=nl.add, operand0=T)
+        if pid == 0:
+            for j in range(P // G):
+                e = e0 + j
+                r = slice(j * G, j * G + 1)
+                nisa.dma_copy(dst=tok.ap(pattern=[[P, 1], [1, P]], offset=e * P), src=nz[r, 0:T])
+                nisa.dma_copy(dst=a.ap(pattern=[[P, 1], [1, P]], offset=e * P), src=ag[r, 0:T])
+                nisa.dma_copy(dst=tok_out.ap(pattern=[[P, 1], [1, P]], offset=e * 2 * P), src=o0[r, 0:T])
+                nisa.dma_copy(dst=tok_out.ap(pattern=[[P, 1], [1, P]], offset=e * 2 * P + P), src=o1[r, 0:T])
+    nisa.core_barrier(tok, (0, 1))
+    nisa.core_barrier(tok_out, (0, 1))
+    nisa.core_barrier(a, (0, 1))
+    out = _out(x)
+    nb = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.sbuf)
+    nisa.memset(dst=nb[0:1, 0:1], value=EL // 2)
+    _blocks(out, x, tok, tok_out, a, bexp, nb, gate_up, gate_up_scale, down, down_scale, limit)
+    return out
+
+
+def _out(x):
+    T, H = x.shape
+    pid = nl.program_id(axis=0)
+    out = nl.ndarray((2 * T, H), dtype=nl.float32, buffer=nl.shared_hbm, name="moe_prefill_tp_out")
+    zero = nl.ndarray((P, H), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.memset(dst=zero[0:P, 0:H], value=0.0)
+    for tb in range(T // P):
+        nisa.dma_copy(dst=out.ap(pattern=[[H, P], [1, H]], offset=(pid * T + tb * P) * H), src=zero[0:P, 0:H])
+    return out
+
+
+def _blocks(out, x, tok, tok_out, aff, bexp, nb, gate_up, gate_up_scale, down, down_scale, limit):
+    """The block loop: ``nb`` [1, 1] int32 (SBUF) the blocks a program runs."""
     T, H = x.shape
     EL, _, KH, C2 = gate_up.shape
     SW = C2 // 2
     n_prg = nl.num_programs(axes=0)
     pid = nl.program_id(axis=0)
-    out = nl.ndarray((2 * T, H), dtype=nl.float32, buffer=nl.shared_hbm, name="moe_prefill_tp_out")
-
-    zero = nl.ndarray((P, H), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.memset(dst=zero[0:P, 0:H], value=0.0)
-    for tb in range(T // P):
-        nisa.dma_copy(dst=out.ap(pattern=[[H, P], [1, H]], offset=(pid * T + tb * P) * H), src=zero[0:P, 0:H])
-
-    nb = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.sbuf)
-    nisa.dma_copy(dst=nb[0:1, 0:1], src=nit.ap(pattern=[[1, 1], [1, 1]], offset=0))
     n_reg = nisa.register_alloc()
     nisa.register_load(n_reg, nb)
     slot = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.sbuf)  # 2 it (this program's block: 2 it + pid)
@@ -132,4 +195,3 @@ def moe_prefill_tp(x, tok, tok_out, aff, bexp, nit, gate_up, gate_up_scale, down
         nisa.tensor_scalar(dst=slot[0:1, 0:1], data=slot[0:1, 0:1], op0=nl.add, operand0=n_prg)
 
     nl.fori_loop(0, n_reg, block)
-    return out

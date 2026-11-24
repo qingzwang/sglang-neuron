@@ -75,58 +75,71 @@ def attn_core_decode(q, cache, slots, bias, onehot, sinks, w_uv, gate_x, o, rank
         nisa.dma_copy(dst=cp[0:H, 0:TT, 0:2], src=ml.ap(pattern=[[TT * 2, H], [2, TT], [1, 2]], offset=0))
         nisa.dma_copy(dst=ml_all.ap(pattern=[[TT * 2, H], [2, TT], [1, 2]], offset=0), src=cp[0:H, 0:TT, 0:2])
     nisa.core_barrier(ml_all, (0, 1))
-    # heads on partitions: mla[h, r, t, 0 / 1]
-    mla = nl.ndarray((H, nr, TT, 2), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.dma_copy(dst=mla[0:H, 0:nr, 0:TT, 0:2], src=ml_all.ap(pattern=[[TT * 2, H], [H * TT * 2, nr], [2, TT], [1, 2]],
-                                                                offset=0))
     snk = nl.ndarray((H, 1), dtype=nl.float32, buffer=nl.sbuf)
     nisa.dma_copy(dst=snk[0:H, 0:1], src=sinks.ap(pattern=[[1, H], [1, 1]], offset=0))
-    big = nl.ndarray((H, TT), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.tensor_reduce(dst=big[0:H, 0:TT], op=nl.maximum,
-                       data=mla.ap(pattern=[[nr * TT * 2, H], [2, TT], [TT * 2, nr]], offset=0), axis=2)
-    nisa.tensor_scalar(dst=big[0:H, 0:TT], data=big[0:H, 0:TT], op0=nl.maximum, operand0=snk[0:H, 0:1])
-    # total = sum_r exp(m_r - M) l_r + exp(sink - M)
-    e = nl.ndarray((H, nr, TT), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.tensor_tensor(dst=e[0:H, 0:nr, 0:TT], data1=mla.ap(pattern=[[nr * TT * 2, H], [TT * 2, nr], [2, TT]], offset=0),
-                       data2=big.ap(pattern=[[TT, H], [0, nr], [1, TT]], offset=0), op=nl.subtract)
-    nisa.activation(dst=e[0:H, 0:nr, 0:TT], op=nl.exp, data=e[0:H, 0:nr, 0:TT])
-    nisa.tensor_tensor(dst=e[0:H, 0:nr, 0:TT], data1=e[0:H, 0:nr, 0:TT],
-                       data2=mla.ap(pattern=[[nr * TT * 2, H], [TT * 2, nr], [2, TT]], offset=1), op=nl.multiply)
-    tot = nl.ndarray((H, TT), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.tensor_reduce(dst=tot[0:H, 0:TT], op=nl.add, data=e.ap(pattern=[[nr * TT, H], [1, TT], [TT, nr]], offset=0),
-                       axis=2)
-    es = nl.ndarray((H, TT), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.tensor_scalar(dst=es[0:H, 0:TT], data=big[0:H, 0:TT], op0=nl.subtract, operand0=snk[0:H, 0:1], op1=nl.multiply,
-                       operand1=-1.0)
-    nisa.activation(dst=es[0:H, 0:TT], op=nl.exp, data=es[0:H, 0:TT])
-    nisa.tensor_tensor(dst=tot[0:H, 0:TT], data1=tot[0:H, 0:TT], data2=es[0:H, 0:TT], op=nl.add)
-    # this rank's factor: exp(m - M) / total
-    ms = nl.ndarray((H, TT, 2), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.dma_copy(dst=ms[0:H, 0:TT, 0:2], src=ml.ap(pattern=[[TT * 2, H], [2, TT], [1, 2]], offset=0))
-    f = nl.ndarray((H, TT), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.tensor_tensor(dst=f[0:H, 0:TT], data1=ms.ap(pattern=[[TT * 2, H], [2, TT]], offset=0), data2=big[0:H, 0:TT],
-                       op=nl.subtract)
-    nisa.activation(dst=f[0:H, 0:TT], op=nl.exp, data=f[0:H, 0:TT])
-    rt = nl.ndarray((H, TT), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.reciprocal(dst=rt[0:H, 0:TT], data=tot[0:H, 0:TT])
-    nisa.tensor_tensor(dst=f[0:H, 0:TT], data1=f[0:H, 0:TT], data2=rt[0:H, 0:TT], op=nl.multiply)
-    # the scaled partial [H, TT, L], each program half of the tokens
-    tpp = TT // n_prg
-    t0 = pid * tpp
-    po = nl.ndarray((H, tpp, L), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.dma_copy(dst=po[0:H, 0:tpp, 0:L], src=out.ap(pattern=[[TT * L, H], [L, tpp], [1, L]], offset=t0 * L))
-    nisa.tensor_tensor(dst=po[0:H, 0:tpp, 0:L], data1=po[0:H, 0:tpp, 0:L],
-                       data2=f.ap(pattern=[[TT, H], [1, tpp], [0, L]], offset=t0), op=nl.multiply)
-    nisa.dma_copy(dst=sc.ap(pattern=[[TT * L, H], [L, tpp], [1, L]], offset=t0 * L), src=po[0:H, 0:tpp, 0:L])
+    # in token chunks of <= TC (SBUF: a 112-row verify's statistics [H, ranks, TT, 2] and scaled partial [H, TT / 2,
+    # L] fp32 do not fit at once); each program scales its half of each chunk
+    TC = 16
+
+    # the chunk's buffers, allocated once: the chunks reuse them in turn
+    mla = nl.ndarray((H, nr, TC, 2), dtype=nl.float32, buffer=nl.sbuf)
+    big = nl.ndarray((H, TC), dtype=nl.float32, buffer=nl.sbuf)
+    e = nl.ndarray((H, nr, TC), dtype=nl.float32, buffer=nl.sbuf)
+    tot = nl.ndarray((H, TC), dtype=nl.float32, buffer=nl.sbuf)
+    es = nl.ndarray((H, TC), dtype=nl.float32, buffer=nl.sbuf)
+    ms = nl.ndarray((H, TC, 2), dtype=nl.float32, buffer=nl.sbuf)
+    f = nl.ndarray((H, TC), dtype=nl.float32, buffer=nl.sbuf)
+    rt = nl.ndarray((H, TC), dtype=nl.float32, buffer=nl.sbuf)
+    po = nl.ndarray((H, TC // 2, L), dtype=nl.float32, buffer=nl.sbuf)
+
+    def stats(c0, tc):
+        # heads on partitions: mla[h, r, t, 0 / 1] of the chunk's tokens
+        nisa.dma_copy(dst=mla[0:H, 0:nr, 0:tc, 0:2],
+                      src=ml_all.ap(pattern=[[TT * 2, H], [H * TT * 2, nr], [2, tc], [1, 2]], offset=c0 * 2))
+        nisa.tensor_reduce(dst=big[0:H, 0:tc], op=nl.maximum,
+                           data=mla.ap(pattern=[[nr * TC * 2, H], [2, tc], [TC * 2, nr]], offset=0), axis=2)
+        nisa.tensor_scalar(dst=big[0:H, 0:tc], data=big[0:H, 0:tc], op0=nl.maximum, operand0=snk[0:H, 0:1])
+        # total = sum_r exp(m_r - M) l_r + exp(sink - M)
+        nisa.tensor_tensor(dst=e[0:H, 0:nr, 0:tc],
+                           data1=mla.ap(pattern=[[nr * TC * 2, H], [TC * 2, nr], [2, tc]], offset=0),
+                           data2=big.ap(pattern=[[TC, H], [0, nr], [1, tc]], offset=0), op=nl.subtract)
+        nisa.activation(dst=e[0:H, 0:nr, 0:tc], op=nl.exp, data=e[0:H, 0:nr, 0:tc])
+        nisa.tensor_tensor(dst=e[0:H, 0:nr, 0:tc], data1=e[0:H, 0:nr, 0:tc],
+                           data2=mla.ap(pattern=[[nr * TC * 2, H], [TC * 2, nr], [2, tc]], offset=1), op=nl.multiply)
+        nisa.tensor_reduce(dst=tot[0:H, 0:tc], op=nl.add,
+                           data=e.ap(pattern=[[nr * TC, H], [1, tc], [TC, nr]], offset=0), axis=2)
+        nisa.tensor_scalar(dst=es[0:H, 0:tc], data=big[0:H, 0:tc], op0=nl.subtract, operand0=snk[0:H, 0:1],
+                           op1=nl.multiply, operand1=-1.0)
+        nisa.activation(dst=es[0:H, 0:tc], op=nl.exp, data=es[0:H, 0:tc])
+        nisa.tensor_tensor(dst=tot[0:H, 0:tc], data1=tot[0:H, 0:tc], data2=es[0:H, 0:tc], op=nl.add)
+        # this rank's factor: exp(m - M) / total
+        nisa.dma_copy(dst=ms[0:H, 0:tc, 0:2], src=ml.ap(pattern=[[TT * 2, H], [2, tc], [1, 2]], offset=c0 * 2))
+        nisa.tensor_tensor(dst=f[0:H, 0:tc], data1=ms.ap(pattern=[[TC * 2, H], [2, tc]], offset=0),
+                           data2=big[0:H, 0:tc], op=nl.subtract)
+        nisa.activation(dst=f[0:H, 0:tc], op=nl.exp, data=f[0:H, 0:tc])
+        nisa.reciprocal(dst=rt[0:H, 0:tc], data=tot[0:H, 0:tc])
+        nisa.tensor_tensor(dst=f[0:H, 0:tc], data1=f[0:H, 0:tc], data2=rt[0:H, 0:tc], op=nl.multiply)
+        # the scaled partial [H, tc, L], each program half of the chunk's tokens
+        tpp = tc // n_prg
+        t0 = c0 + pid * tpp
+        nisa.dma_copy(dst=po[0:H, 0:tpp, 0:L], src=out.ap(pattern=[[TT * L, H], [L, tpp], [1, L]], offset=t0 * L))
+        nisa.tensor_tensor(dst=po[0:H, 0:tpp, 0:L], data1=po[0:H, 0:tpp, 0:L],
+                           data2=f.ap(pattern=[[TC, H], [1, tpp], [0, L]], offset=pid * tpp), op=nl.multiply)
+        nisa.dma_copy(dst=sc.ap(pattern=[[TT * L, H], [L, tpp], [1, L]], offset=t0 * L), src=po[0:H, 0:tpp, 0:L])
+
+    for c0 in range(0, TT, TC):
+        stats(c0, min(TC, TT - c0))
     nisa.core_barrier(sc, (0, 1))
     if "rs" in hooks:
         hooks["rs"]()
     if group is not None:
         ncc.reduce_scatter(srcs=[sc], dsts=[att], op=nl.add, replica_group=group, collective_dim=0)
     else:
-        cpa = nl.ndarray((H, TT, L), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.dma_copy(dst=cpa[0:H, 0:TT, 0:L], src=sc.ap(pattern=[[TT * L, H], [L, TT], [1, L]], offset=0))
-        nisa.dma_copy(dst=att.ap(pattern=[[TT * L, H], [L, TT], [1, L]], offset=0), src=cpa[0:H, 0:TT, 0:L])
+        cpa = nl.ndarray((H, TC, L), dtype=nl.float32, buffer=nl.sbuf)
+        for c0 in range(0, TT, TC):
+            tc = min(TC, TT - c0)
+            nisa.dma_copy(dst=cpa[0:H, 0:tc, 0:L], src=sc.ap(pattern=[[TT * L, H], [L, tc], [1, L]], offset=c0 * L))
+            nisa.dma_copy(dst=att.ap(pattern=[[TT * L, H], [L, tc], [1, L]], offset=c0 * L), src=cpa[0:H, 0:tc, 0:L])
     nisa.core_barrier(att, (0, 1))
 
     # ---- the output: values = bf16(att) @ w_uv^T, gated, @ o (this program's columns), all-reduced -----------------

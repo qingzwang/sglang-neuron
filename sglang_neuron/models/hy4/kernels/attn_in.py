@@ -143,11 +143,8 @@ def attn_in_decode(x, ln_w, q_a, qa_ln_w, q_b, w_uk, kv_a, kva_ln_w, cos, sin, c
     xt = nl.ndarray((T, H), dtype=x.dtype, buffer=nl.sbuf)
     nisa.dma_copy(dst=xt[0:T, 0:H], src=x.ap(pattern=[[H, T], [1, H]], offset=0))
     TA = T + T % 2  # a bf16 PSUM slice must be 4-byte aligned
-    xps = nl.ndarray((P, KH, TA), dtype=nl.bfloat16, buffer=nl.psum)
-    for kb in range(KH):
-        nisa.nc_transpose(dst=xps[0:P, kb, 0:T], data=xt[0:T, kb * P:(kb + 1) * P])
     xr = nl.ndarray((P, KH, T), dtype=nl.bfloat16, buffer=nl.sbuf)
-    nisa.tensor_copy(dst=xr[0:P, 0:KH, 0:T], src=xps[0:P, 0:KH, 0:T])
+    _transpose_blocks(xr, xt, T, KH, TA)
     sq = nl.ndarray((P, KH, T), dtype=nl.float32, buffer=nl.sbuf)
     nisa.tensor_tensor(dst=sq[0:P, 0:KH, 0:T], data1=xr[0:P, 0:KH, 0:T], data2=xr[0:P, 0:KH, 0:T], op=nl.multiply)
     ssp = nl.ndarray((P, T), dtype=nl.float32, buffer=nl.sbuf)
@@ -272,19 +269,23 @@ def attn_in_decode(x, ln_w, q_a, qa_ln_w, q_b, w_uk, kv_a, kva_ln_w, cos, sin, c
         nisa.tensor_copy(dst=cq[0:T, 0, L:NKV], src=cp[0:T, L:NKV])
         c8 = nl.ndarray((T, 1, CW), dtype=nl.uint8, buffer=nl.sbuf)
         pack_rows(c8, cq, T, 1, L, NKV - L)
-    if pid == 0:
+    if pid == 0 and T <= 8:
         for t in range(T):
             r = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.sbuf)
             nisa.dma_copy(dst=r[0:1, 0:1], src=write_rows.ap(pattern=[[T, 1], [1, 1]], offset=t))
             nisa.dma_copy(dst=cache.ap(pattern=[[CW, 1], [1, CW]], offset=0, scalar_offset=r, indirect_dim=0),
                           src=cp[t:t + 1, 0:CW] if c8 is None else c8[t:t + 1, 0, 0:CW])
+    elif pid == 0:
+        # many rows (a multi-request verify): one scatter, a row a partition (rows another rank owns all land in
+        # the reserved row 0)
+        wr = nl.ndarray((T, 1), dtype=nl.int32, buffer=nl.sbuf)
+        nisa.dma_copy(dst=wr[0:T, 0:1], src=write_rows.ap(pattern=[[1, T], [1, 1]], offset=0))
+        nisa.dma_copy(dst=cache.ap(pattern=[[CW, T], [1, CW]], offset=0, vector_offset=wr[0:T, 0:1], indirect_dim=0),
+                      src=cp[0:T, 0:CW] if c8 is None else c8[0:T, 0, 0:CW], dge_mode=nisa.dge_mode.swdge)
     # q = q_lat @ q_b: q_lat transposed as the stationary
     KQ = QL // P
-    qlp = nl.ndarray((P, KQ, TA), dtype=nl.bfloat16, buffer=nl.psum)
-    for k in range(KQ):
-        nisa.nc_transpose(dst=qlp[0:P, k, 0:T], data=ql[0:T, k * P:(k + 1) * P])
     qlT = nl.ndarray((P, KQ, T), dtype=nl.bfloat16, buffer=nl.sbuf)
-    nisa.tensor_copy(dst=qlT[0:P, 0:KQ, 0:T], src=qlp[0:P, 0:KQ, 0:T])
+    _transpose_blocks(qlT, ql, T, KQ, TA)
     qbw = nl.ndarray((P, KQ, D), dtype=q_b.dtype, buffer=nl.sbuf)
     nisa.dma_copy(dst=qbw[0:P, 0:KQ, 0:D], src=q_b.ap(pattern=[[D, P], [P * D, KQ], [1, D]], offset=0),
                   dge_mode=nisa.dge_mode.hwdge, engine=nisa.engine.sync)
@@ -344,6 +345,18 @@ def attn_in_decode(x, ln_w, q_a, qa_ln_w, q_b, w_uk, kv_a, kva_ln_w, cos, sin, c
     if gate is not None:
         return query, compact, q_lat, cache, gate_x
     return query, compact, q_lat, cache
+
+
+def _transpose_blocks(dst, src, T, KB, TA):
+    """dst [128, KB, T] (SBUF) = src [T, 128 KB] transposed in 128-column blocks, through PSUM a bank at a time (a
+    transpose cannot write across banks: at T > 8 the KB blocks of T bf16 span several)."""
+    per = max(1, 2048 // (TA * 2))
+    for k0 in range(0, KB, per):
+        kn = min(per, KB - k0)
+        tp = nl.ndarray((P, per, TA), dtype=nl.bfloat16, buffer=nl.psum)
+        for k in range(kn):
+            nisa.nc_transpose(dst=tp[0:P, k, 0:T], data=src[0:T, (k0 + k) * P:(k0 + k + 1) * P])
+        nisa.tensor_copy(dst=dst[0:P, k0:k0 + kn, 0:T], src=tp[0:P, 0:kn, 0:T])
 
 
 def qkv_shard_layout(q_a, kv_a, gate, rank: int, ranks: int):

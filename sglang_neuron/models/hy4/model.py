@@ -427,6 +427,8 @@ _MOE_DECODE_V2 = os.environ.get("HY4_MOE_DECODE_V2", "1") != "0"
 _NKI_COMPACT = _NKI and os.environ.get("HY4_NKI_COMPACT", "1") != "0"
 _NKI_HC_DECODE = _NKI and os.environ.get("HY4_NKI_HC_DECODE", "1") != "0"
 _HC_CHAIN = os.environ.get("HY4_HC_CHAIN", "0") == "1"  # the decode's layer-boundary HC post + pre in one kernel
+# decode rows the HC kernels take (past them the XLA post / pre)
+_HC_DEC_ROWS = int(os.environ.get("HY4_HC_DEC_ROWS", "16"))  # 112 rows: XLA 1.4 ms a group faster
 _NKI_ATTN_IN = _NKI and os.environ.get("HY4_NKI_ATTN_IN", "0") == "1"  # the decode attention input kernel
 # its q_a / kv_a sharded over the attention TP (kernels/attn_in.py qkv_sh; the prefill keeps the replicated ones)
 _QKV_SH = _NKI_ATTN_IN and os.environ.get("HY4_QKV_SH", "0") == "1"
@@ -486,6 +488,12 @@ def _nki_hc_ok(streams) -> bool:
     return _NKI_HC and streams.device.type != "cpu" and streams.dim() == 3 and streams.shape[0] % 256 == 0
 
 
+# the decode rows the attention input / core kernels take (kernels/attn_in.py, attn_core.py: PSUM banks split and
+# token chunks past 8 rows); HY4_ATTN_ROWS=8 keeps a multi-request verify on the XLA attention
+_ATTN_ROWS = int(os.environ.get("HY4_ATTN_ROWS", "128"))
+# HY4_MOE_DECODE_BLOCKS=1: a padded decode batch's MoE block list on chip (moe_decode_tp: every local expert a block);
+# off: moe_blocks' list of the hit experts only (at 112 profiled rows the routing hit few experts: 0.9 vs 8.2 ms a group)
+_MOE_DECODE_BLOCKS = os.environ.get("HY4_MOE_DECODE_BLOCKS", "0") == "1"
 # HY4_TOPK_SELECT=1: the decode's selection on the GpSimd top-k (Hy4Graph._topk_state) instead of topk_mask's bins
 # and decode_compact
 _TOPK_SELECT = os.environ.get("HY4_TOPK_SELECT", "0") == "1"
@@ -653,10 +661,20 @@ class MoE(nn.Module):
             xp = torch.cat([xp, xp.new_zeros((pad, xp.shape[1]))])
             aff = torch.cat([aff, aff.new_zeros((pad, aff.shape[1]))])
         tp_ = t + pad
-        tok, tok_out, a, bexp, nblk = moe_blocks(aff, top_k=self.config.num_experts_per_tok)
-        out = wrap_nki(moe_prefill_tp)[get_logical_nc_config()](
-            xp, tok, tok_out, a, bexp, ((nblk + 1) // 2).to(torch.int32), self.gate_up_tp,
-            self.gate_up_scale_tp, self.down_tp, self.down_scale_tp, limit=float(self.config.swiglu_limit or 3.0e38))
+        limit = float(self.config.swiglu_limit or 3.0e38)
+        if _MOE_DECODE_BLOCKS and self.phase == "decode" and tp_ == 128 and aff.shape[1] % 16 == 0:
+            # the block list on chip (kernels/moe_prefill_tp.moe_decode_tp): no moe_blocks sort / compaction
+            from sglang_neuron.models.hy4.kernels.moe_prefill_tp import moe_decode_tp
+
+            bexp = torch.arange(aff.shape[1], device=x.device, dtype=torch.int32).reshape(-1, 1)
+            out = wrap_nki(moe_decode_tp)[get_logical_nc_config()](
+                xp, aff.to(torch.float32).contiguous(), bexp, self.gate_up_tp, self.gate_up_scale_tp, self.down_tp,
+                self.down_scale_tp, limit=limit)
+        else:
+            tok, tok_out, a, bexp, nblk = moe_blocks(aff, top_k=self.config.num_experts_per_tok)
+            out = wrap_nki(moe_prefill_tp)[get_logical_nc_config()](
+                xp, tok, tok_out, a, bexp, ((nblk + 1) // 2).to(torch.int32), self.gate_up_tp,
+                self.gate_up_scale_tp, self.down_tp, self.down_scale_tp, limit=limit)
         out = out.view(2, tp_, -1).sum(0)[:t].to(DTYPE)
         if self.shared is not None:
             out = out + self.shared(x)
@@ -998,7 +1016,7 @@ class Hy4Graph(nn.Module):
             x, post = streams[:, 0], None
         else:
             x, post = layer.attn_hc.pre(streams, replicated)
-        if _NKI_ATTN_IN and self.phase == "decode" and x.shape[0] <= 8 and x.device.type != "cpu" and not _ABLATE:
+        if _NKI_ATTN_IN and self.phase == "decode" and x.shape[0] <= _ATTN_ROWS and x.device.type != "cpu" and not _ABLATE:
             # the norm, the projections, RoPE and the query's all-gather in one kernel (kernels/attn_in.py); the
             # graph's own normed input feeds the indexer and the output gate only
             query, compact, q_lat = attn.project_fused(x, layer.input_layernorm.weight, cos, sin, cache, write_rows)
@@ -1029,7 +1047,7 @@ class Hy4Graph(nn.Module):
             if state is None or not _topk_select_ok(self.phase, key_rows, x):
                 state = self._compact(selected, scores, key_rows) if self._sparse(key_rows) else (
                     (selected.to(torch.float32) - 1.0) * -MASKED,)
-        if (_NKI_ATTN_CORE and self.phase == "decode" and self._sparse(key_rows) and x.shape[0] <= 8
+        if (_NKI_ATTN_CORE and self.phase == "decode" and self._sparse(key_rows) and x.shape[0] <= _ATTN_ROWS
                 and x.device.type != "cpu" and not _ABLATE and attn.heads == 1):
             # the attention, its merge and the output projection with their three collectives in one kernel
             out = self._attend_core_kernel(attn, cache, query, *state, x)
@@ -1044,7 +1062,8 @@ class Hy4Graph(nn.Module):
         if "hc" in _ABLATE:
             streams = streams + out[:, None, :]
             x = streams[:, 0]
-        elif self.phase == "decode" and _NKI_HC_DECODE and streams.device.type != "cpu":
+        elif (self.phase == "decode" and _NKI_HC_DECODE and streams.device.type != "cpu"
+              and streams.shape[0] <= _HC_DEC_ROWS):
             # the attention's post and the MLP's pre in one NKI kernel (kernels/hc_decode.py)
             streams, x, post = layer.mlp_hc.post_pre_decode(streams, out, post)
         else:
@@ -1107,7 +1126,8 @@ class Hy4Graph(nn.Module):
 
     def defers_hc(self, streams) -> bool:
         """Whether a group's layers hand their MLP's post update to the next layer's pre (one hc_decode kernel)."""
-        return _HC_CHAIN and self.phase == "decode" and _NKI_HC_DECODE and streams.device.type != "cpu" and not _ABLATE
+        return (_HC_CHAIN and self.phase == "decode" and _NKI_HC_DECODE and streams.device.type != "cpu" and not _ABLATE
+                and streams.shape[0] <= _HC_DEC_ROWS)
 
     def epilogue(self, streams, sampling_positions):
         """The sampled rows' logits [rows, vocab / tp] (fp32: enable_lm_head_fp32)."""
