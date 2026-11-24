@@ -70,6 +70,17 @@ def transposed() -> SafetensorsWeightLoader:
     return SafetensorsWeightLoader(transform=lambda slices, rank: slices[0][:].t())
 
 
+def hc_hilo() -> SafetensorsWeightLoader:
+    """A hyper-connection's fn [rows, width] (fp32) as kernels/hc.py hc_pre takes it: fn^T's bf16 high half then its
+    bf16 remainder, [width, 2 rows]."""
+    def transform(slices, rank):
+        fnT = slices[0][:].to(torch.float32).t()
+        hi = fnT.to(torch.bfloat16)
+        return torch.cat([hi, (fnT - hi.float()).to(torch.bfloat16)], 1).contiguous()
+
+    return SafetensorsWeightLoader(transform=transform)
+
+
 def as_float() -> SafetensorsWeightLoader:
     return SafetensorsWeightLoader(transform=lambda slices, rank: slices[0][:].to(torch.float32))
 

@@ -673,6 +673,11 @@ class HyperConnection(nn.Module):
         self.fn = nn.Parameter(torch.empty(rows, width, dtype=torch.float32))
         self.base = nn.Parameter(torch.empty(rows, dtype=torch.float32))
         self.scale = nn.Parameter(torch.empty(2 if rows == 2 * config.hc_mult else 1, dtype=torch.float32))
+        if rows == 2 * config.hc_mult:
+            # kernels/hc.py hc_pre's weights: fn^T as a bf16 high and low half [width, 2 rows], made once at load (in
+            # the graph: an XLA transpose and split each call, ~0.5 ms a 4-layer prefill group)
+            self.fn_hilo = nn.Parameter(torch.empty(width, 2 * rows, dtype=DTYPE))
+            set_weight_loader(self.fn_hilo, weights.hc_hilo())
 
     def _mixes(self, streams):
         flat = streams.flatten(1).float()
@@ -708,13 +713,15 @@ class HyperConnection(nn.Module):
 
         cfg = self.config
         n, rows = cfg.hc_mult, self.fn.shape[0]
-        fnT = self.fn.t()
-        hi = fnT.to(DTYPE)
-        lo = (fnT - hi.float()).to(DTYPE)
+        hilo = getattr(self, "fn_hilo", None)
+        if hilo is None:
+            fnT = self.fn.t()
+            hi = fnT.to(DTYPE)
+            hilo = torch.cat([hi, (fnT - hi.float()).to(DTYPE)], 1).contiguous()
         scale = torch.cat([self.scale[0].expand(n), self.scale[-1].expand(rows - n)]) if rows == 2 * n else \
             self.scale[0].expand(rows)
         x, post = wrap_nki(hc_pre)[get_logical_nc_config()](
-            streams.reshape(streams.shape[0], -1), torch.cat([hi, lo], 1).contiguous(),
+            streams.reshape(streams.shape[0], -1), hilo,
             torch.stack([scale, self.base]).contiguous(), rms_eps=cfg.rms_norm_eps, hc_eps=cfg.hc_eps,
             magnitude=cfg.hc_magnitude)
         return x, post
@@ -1221,6 +1228,7 @@ class Hy4Graph(nn.Module):
             fp8 = not (i == 0)
             for hc, name in (("attn_hc", "hc_attn_layer"), ("mlp_hc", "hc_mlp_layer")):
                 mappings.update({f"{dst}.{hc}.fn": f"{src}.{name}.hc_pre.hc_fn",
+                                 f"{dst}.{hc}.fn_hilo": f"{src}.{name}.hc_pre.hc_fn",
                                  f"{dst}.{hc}.base": f"{src}.{name}.hc_pre.hc_base",
                                  f"{dst}.{hc}.scale": f"{src}.{name}.hc_pre.hc_scale"})
             mappings.update({
