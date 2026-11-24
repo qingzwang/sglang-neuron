@@ -250,6 +250,8 @@ MODELS = {
                                      "224 at load, models/hy4/weights.py)"),),
                                  # the checkpoint's DFly drafter under SGLang's DFLASH scheduling (models/hy4/dfly.py)
                                  speculative_algorithms=("DFLASH",),
+                                 # the PD decode's HiCache host tier over the store (models/hy4/kv.py Hy4HostPool)
+                                 decode_hicache_env="SGLANG_NEURON_HY4_HICACHE",
                                  owns_dsa_attention=True),
     "GlmMoeDsaForCausalLM": ModelSpec(
         package="sglang_neuron.models.glm52",

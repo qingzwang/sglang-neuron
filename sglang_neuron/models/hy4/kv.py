@@ -83,6 +83,22 @@ def accounting_pool_cls():
             lens = [t.numel() * t.element_size() for t in regions]
             return ptrs, lens, [store.block * t.shape[1] * t.element_size() for t in regions]
 
+        def get_device_pool_infos(self, *args, **kwargs):
+            raise RuntimeError("Hy4's KV lives in its context-parallel store, not the accounting pool's buffers: "
+                               "its HiCache host pool is Hy4HostPool (neuron_host_pool)")
+
+        def neuron_host_pool(self, *, page_size, host_size, pool_label="kv"):
+            """HiCache's host tier over the store (mla_host_pool.build_kv_host_pool dispatches here)."""
+            from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler
+            from sglang.srt.runtime_context import get_memory
+
+            memory = get_memory()
+            return hy4_host_pool_cls()(
+                self, host_to_device_ratio=memory.hicache_ratio,
+                host_size=memory.hicache_size if host_size is None else host_size, page_size=page_size,
+                layout=memory.hicache_mem_layout, allocator_type=hybrid_pool_assembler._get_allocator_type(),
+                pool_label=pool_label)
+
         def get_kv_layer_ids(self):
             """The model layer of each region get_contiguous_buf_infos lists (both PD peers pair the entries by
             them): every layer's MLA rows, then each full layer's index keys."""
@@ -90,6 +106,33 @@ def accounting_pool_cls():
             return list(range(len(store.latent))) + list(store.index_layers)
 
     return Hy4AccountingPool
+
+
+@functools.lru_cache(maxsize=None)
+def hy4_host_pool_cls():
+    """HiCache's host tier (L2) of Hy4's store: one host region per store tensor, a host page each region's rows of
+    one SGLang page on this rank (its block of 16 rows at TP64 / page 1024). The page id is the token page on every
+    rank (the store is context-parallel like the token-CP MHA pool), so the controller's indices pass untranslated and
+    each rank moves its own share; the unit is SGLang's whole page. A load runs whole (the compiled forward reads
+    every layer at once)."""
+    from sglang_neuron.mem_cache.host_pool import NeuronPagedHostPool
+
+    class Hy4HostPool(NeuronPagedHostPool):
+        def __init__(self, kv_pool, *, host_to_device_ratio, host_size, page_size: int, layout: str, allocator_type,
+                     pool_label: str = "kv"):
+            store = kv_pool.hy4_store
+            if store is None:
+                raise RuntimeError("Hy4's HiCache host pool needs the KV store bound to the accounting pool")
+            if page_size != store.page:
+                raise ValueError(f"HiCache's {page_size}-token page is not Hy4's {store.page}-token KV page")
+            views = [t.view(store.pages, store.block, t.shape[1]) for t in store.latent + store.index]
+            super().__init__(views, dtype=DTYPE, page_size=page_size, layer_num=1,
+                             device_capacity_tokens=kv_pool.size, start_layer=0, end_layer=0,
+                             host_to_device_ratio=host_to_device_ratio, host_size=host_size, layout=layout,
+                             allocator_type=allocator_type, pool_label=pool_label, device_page_limit=store.pages,
+                             load_layer=0, unit=page_size)
+
+    return Hy4HostPool
 
 
 def configure_kv_cache(configurator, config: Hy4Config, *, tp: int, device):

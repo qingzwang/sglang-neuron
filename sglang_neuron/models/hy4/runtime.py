@@ -215,12 +215,16 @@ class StagedStep:
         page = int(md["block_size"])
         length, self.next_length = self.next_length, None
         buckets = [b for b in self.context_buckets if b // page < table.shape[-1]]
-        pick = next((b for b in buckets if length is not None and b >= length), None)
+        # a bucket that covers the server's context (the table's pages but its spare one) stands in for the whole
+        # table, which is then never run nor compiled: at 1M tokens the whole table's keys (1025 pages, not a whole
+        # 512-key tile a rank) take the XLA indexer, which neuronx-cc fails to compile (ISGV902)
+        covers = bool(buckets) and max(buckets) // page >= table.shape[-1] - 1
+        pick = next((b for b in buckets if length is not None and b >= length), max(buckets) if covers else None)
         chosen = [pick]
         rows = tuple(kwargs["positions"].shape)
         if rows not in self._warmed:
-            # a step shape's first prefill (the warm-up's) compiles every bucket's programs
-            chosen = [b for b in buckets + [None] if b != pick] + [pick]
+            # a step shape's first prefill (the warm-up's) compiles every bucket's programs (and the whole table's)
+            chosen = [b for b in buckets + ([] if covers else [None]) if b != pick] + [pick]
             self._warmed.add(rows)
         if _TIMING and int(self.graph.group.coordinator.rank_in_group) == 0:
             logger.info("Hy4 prefill length %s -> context bucket %s (table %d pages)", length, chosen,

@@ -68,6 +68,7 @@ KNOBS: dict = {
     # the kv_cp=1 PD prefill's token-major K pages (models/qwen35/config.KV_TM_ENV)
     "SGLANG_NEURON_QWEN35_KV_TM": CONFIG,
     "SGLANG_NEURON_QWEN35_HICACHE": CONFIG,
+    "SGLANG_NEURON_HY4_HICACHE": CONFIG,
     # Qwen3.5's kv_cp scatter (sglang_patches.kv_cp_scatter): the posted-batch descriptor bound and drain, and its
     # prep/send dump; the model runtime's state dump (models/qwen35/runtime.py)
     "SGLANG_NEURON_QWEN35_SCATTER_MAX_DESCS": DEBUG,

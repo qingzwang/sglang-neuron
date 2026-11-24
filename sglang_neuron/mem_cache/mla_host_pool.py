@@ -131,6 +131,12 @@ def build_kv_host_pool(original, *, kv_pool, page_size, use_mla=None, override_k
                        mtp_draft_device_pools=(), pool_label="kv"):
     """hybrid_pool_assembler.build_kv_host_pool: a Neuron latent pool's KV host pool is NeuronLatentHostPool, sized as
     upstream sizes the MLA host pool (--hicache-ratio of the pool's tokens, or --hicache-size)."""
+    factory = getattr(kv_pool, "neuron_host_pool", None)
+    if factory is not None:
+        # a model's own KV store behind an accounting pool (Hy4, models/hy4/kv.py): its host pool is its own
+        if mtp_draft_device_pools:
+            raise ValueError("Neuron HiCache keeps no MTP draft KV")
+        return factory(page_size=page_size, host_size=host_size, pool_label=pool_label)
     if not is_neuron_latent_pool(kv_pool):
         return original(kv_pool=kv_pool, page_size=page_size, use_mla=use_mla,
                         override_kv_cache_dim=override_kv_cache_dim, host_size=host_size,
